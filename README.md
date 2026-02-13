@@ -2,6 +2,8 @@
 
 A simple Flask application that collects and stores coding agent traces from tools like **Cursor** and **Claude Code**. Traces are sent to this centralised service and stored in PostgreSQL, enabling cross-project visibility, team collaboration, and persistent trace history.
 
+This implementation is built to the [Agent Trace](https://agent-trace.dev/) specification. 
+
 ## Project Structure
 
 ```
@@ -217,4 +219,4 @@ model.py                   ← Dataclasses (Project, TraceFields, etc.)
 
 ## License
 
-MIT
+Licensed under the [Apache License 2.0](LICENSE).
