@@ -12,13 +12,17 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
 from typing import Any
 
-from model import TraceFields
+from model import AttributionResult, TraceFields
+import attribution as attr
 import database_service as db
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -232,3 +236,246 @@ def query_traces(
 
 def get_trace_detail(project_id: str, trace_id: str) -> dict[str, Any] | None:
     return db.get_trace(project_id, trace_id)
+
+
+# ---------------------------------------------------------------------------
+# Commit links
+# ---------------------------------------------------------------------------
+
+def ingest_commit_link(
+    project_id: str,
+    user_id: str,
+    commit_link_data: dict[str, Any],
+) -> str:
+    """Validate and store a commit-trace link.  Returns the commit_sha."""
+    commit_sha = commit_link_data.get("commit_sha", "")
+    parent_sha = commit_link_data.get("parent_sha")
+    trace_ids = commit_link_data.get("trace_ids", [])
+    files_changed = commit_link_data.get("files_changed")
+    committed_at = commit_link_data.get("committed_at")
+
+    if not commit_sha:
+        raise ValueError("commit_sha is required")
+    if not isinstance(trace_ids, list) or not trace_ids:
+        raise ValueError("trace_ids must be a non-empty list")
+
+    db.ensure_project(project_id)
+    db.insert_commit_link(
+        project_id=project_id,
+        user_id=user_id,
+        commit_sha=commit_sha,
+        parent_sha=parent_sha,
+        trace_ids=trace_ids,
+        files_changed=files_changed,
+        committed_at=committed_at,
+    )
+    return commit_sha
+
+
+def get_commit_link_detail(
+    project_id: str,
+    commit_sha: str,
+) -> dict[str, Any] | None:
+    """Return commit link with expanded trace data."""
+    link = db.get_commit_link(project_id, commit_sha)
+    if not link:
+        return None
+
+    # Enrich with trace summaries for each linked trace
+    trace_summaries = []
+    for tid in link.get("trace_ids", []):
+        trace_data = db.get_trace(project_id, tid)
+        if trace_data:
+            trace_record = trace_data["trace"]
+            # trace_record is the full JSON dict (auto-decoded by psycopg2 JSONB)
+            summary: dict[str, Any] = {"trace_id": tid}
+            if isinstance(trace_record, dict):
+                summary["timestamp"] = trace_record.get("timestamp")
+                summary["tool"] = trace_record.get("tool")
+                # Extract model from first conversation contributor
+                for fe in trace_record.get("files", []):
+                    for conv in fe.get("conversations", []):
+                        contributor = conv.get("contributor", {})
+                        if contributor.get("model_id"):
+                            summary["model_id"] = contributor["model_id"]
+                            break
+                    if "model_id" in summary:
+                        break
+            trace_summaries.append(summary)
+        else:
+            trace_summaries.append({"trace_id": tid, "found": False})
+
+    link["trace_summaries"] = trace_summaries
+    return link
+
+
+# ---------------------------------------------------------------------------
+# Blame
+# ---------------------------------------------------------------------------
+
+MAX_CONVERSATION_SUMMARY_LEN = 200
+
+
+def blame_file(
+    project_id: str,
+    file_path: str,
+    blame_data: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Run attribution for each blame segment and return aggregated results.
+
+    Parameters
+    ----------
+    project_id : str
+        The project to search for traces in.
+    file_path : str
+        Path of the file being blamed.
+    blame_data : list[dict]
+        List of blame segments from the client.  Each segment has:
+          - start_line (int)
+          - end_line (int)
+          - commit_sha (str)
+          - parent_sha (str | None)
+          - content_hash (str | None)
+          - timestamp (str | None)  — ISO-8601 author date of the commit
+
+    Returns
+    -------
+    dict
+        {
+            "file_path": "...",
+            "attributions": [
+                {
+                    "start_line": N,
+                    "end_line": M,
+                    "tier": 1-6 or null,
+                    "confidence": 0.0-1.0,
+                    "trace_id": "..." or null,
+                    "contributor": {"type": "ai", "model_id": "..."},
+                    "conversation_url": "..." or null,
+                    "conversation_summary": "first N chars..." or null,
+                    "tool": {...} or null,
+                    "signals": [...],
+                    "commit_link_match": bool,
+                    "content_hash_match": bool,
+                }
+            ]
+        }
+    """
+    # Attribute each segment — one attribution per blame segment.
+    # Within a segment all lines share the same commit, so we attribute at
+    # the segment level rather than per-line (the commit SHA is the same for
+    # every line in the segment).
+    raw_results: list[tuple[dict[str, Any], AttributionResult]] = []
+
+    for segment in blame_data:
+        start_line = segment.get("start_line")
+        end_line = segment.get("end_line")
+        commit_sha = segment.get("commit_sha", "")
+        parent_sha = segment.get("parent_sha")
+        content_hash = segment.get("content_hash")
+        timestamp = segment.get("timestamp")
+
+        if start_line is None or end_line is None or not commit_sha:
+            logger.debug("Skipping incomplete blame segment: %s", segment)
+            continue
+
+        # Use the midpoint of the range as the representative line
+        # (the attribution engine checks range containment, so any line
+        # within the range produces the same result for the same trace).
+        representative_line = (start_line + end_line) // 2
+
+        result = attr.attribute_line(
+            project_id=project_id,
+            file_path=file_path,
+            line_number=representative_line,
+            blame_commit=commit_sha,
+            blame_parent=parent_sha,
+            content_hash=content_hash,
+            blame_timestamp=timestamp,
+        )
+        raw_results.append((segment, result))
+
+    # Group adjacent segments with the same attribution
+    attributions = _merge_attributions(raw_results)
+
+    return {
+        "file_path": file_path,
+        "attributions": attributions,
+    }
+
+
+def _merge_attributions(
+    raw_results: list[tuple[dict[str, Any], AttributionResult]],
+) -> list[dict[str, Any]]:
+    """Merge adjacent blame segments that share the same attribution into
+    contiguous ranges.
+
+    Two segments are merged when they are adjacent (prev.end_line + 1 ==
+    next.start_line) *and* they attributed to the same trace_id with the
+    same tier.
+    """
+    if not raw_results:
+        return []
+
+    merged: list[dict[str, Any]] = []
+
+    for segment, result in raw_results:
+        entry = _format_attribution(segment, result)
+
+        if merged:
+            prev = merged[-1]
+            # Merge if adjacent and same attribution identity
+            if (
+                prev["end_line"] + 1 >= entry["start_line"]
+                and prev["trace_id"] == entry["trace_id"]
+                and prev["tier"] == entry["tier"]
+            ):
+                prev["end_line"] = entry["end_line"]
+                continue
+
+        merged.append(entry)
+
+    return merged
+
+
+def _format_attribution(
+    segment: dict[str, Any],
+    result: AttributionResult,
+) -> dict[str, Any]:
+    """Format a single attribution result for the API response."""
+    entry: dict[str, Any] = {
+        "start_line": segment.get("start_line"),
+        "end_line": segment.get("end_line"),
+        "tier": result.tier,
+        "confidence": result.confidence,
+        "trace_id": result.trace_id,
+    }
+
+    # Add contributor info
+    if result.contributor_type or result.model_id:
+        contributor: dict[str, Any] = {}
+        if result.contributor_type:
+            contributor["type"] = result.contributor_type
+        if result.model_id:
+            contributor["model_id"] = result.model_id
+        entry["contributor"] = contributor
+
+    # Conversation info
+    if result.conversation_url:
+        entry["conversation_url"] = result.conversation_url
+    if result.conversation_content:
+        summary = result.conversation_content[:MAX_CONVERSATION_SUMMARY_LEN]
+        if len(result.conversation_content) > MAX_CONVERSATION_SUMMARY_LEN:
+            summary += "..."
+        entry["conversation_summary"] = summary
+
+    # Tool info
+    if result.tool:
+        entry["tool"] = result.tool
+
+    # Signals & match flags
+    entry["signals"] = result.signals
+    entry["commit_link_match"] = result.commit_link_match
+    entry["content_hash_match"] = result.content_hash_match
+
+    return entry

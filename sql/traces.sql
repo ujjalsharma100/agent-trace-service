@@ -29,3 +29,11 @@ CREATE INDEX IF NOT EXISTS traces_user_id_idx          ON traces (user_id);
 CREATE INDEX IF NOT EXISTS traces_trace_timestamp_idx  ON traces (trace_timestamp);
 CREATE INDEX IF NOT EXISTS traces_tool_idx             ON traces USING GIN (tool);
 CREATE INDEX IF NOT EXISTS traces_metadata_idx         ON traces USING GIN (metadata);
+
+-- For blame queries: find traces by VCS revision
+CREATE INDEX IF NOT EXISTS traces_vcs_revision_idx
+    ON traces ((vcs->>'revision'));
+
+-- For blame queries: find traces by file path (GIN on files JSONB)
+CREATE INDEX IF NOT EXISTS traces_files_idx
+    ON traces USING GIN (files);

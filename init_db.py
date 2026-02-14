@@ -36,6 +36,7 @@ SQL_FILES = [
     "projects.sql",
     "traces.sql",
     "conversation_contents.sql",
+    "commit_links.sql",
 ]
 
 SQL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sql")
@@ -66,6 +67,7 @@ def drop_tables(conn):
     """Drop all application tables."""
     with conn.cursor() as cur:
         cur.execute("""
+            DROP TABLE IF EXISTS commit_links CASCADE;
             DROP TABLE IF EXISTS conversation_contents CASCADE;
             DROP TABLE IF EXISTS traces CASCADE;
             DROP TABLE IF EXISTS projects CASCADE;
@@ -83,7 +85,7 @@ def reset_tables(conn):
 
 def show_status(conn):
     """Print row counts for each table."""
-    tables = ["projects", "traces", "conversation_contents"]
+    tables = ["projects", "traces", "conversation_contents", "commit_links"]
     print("Database status:\n")
     with conn.cursor() as cur:
         for table in tables:

@@ -61,13 +61,16 @@ def require_auth(f):
 def root():
     return jsonify({
         "name": "agent-trace-service",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "docs": {
             "health": "GET /health",
             "ingest_trace": "POST /api/v1/traces",
             "batch_ingest": "POST /api/v1/traces/batch",
             "list_traces": "GET /api/v1/traces?project_id=<id>",
             "get_trace": "GET /api/v1/traces/<traceId>?project_id=<id>",
+            "ingest_commit_link": "POST /api/v1/commit-links",
+            "get_commit_link": "GET /api/v1/commit-links/<commitSha>?project_id=<id>",
+            "blame_file": "POST /api/v1/blame",
             "sync_conversation": "POST /api/v1/conversations/sync",
             "project_info": "GET /api/v1/projects/<projectId>",
             "create_project": "POST /api/v1/projects",
@@ -208,6 +211,104 @@ def get_trace(trace_id):
     result = service.get_trace_detail(project_id, trace_id)
     if result is None:
         return jsonify({"error": "Trace not found"}), 404
+    return jsonify(result)
+
+
+# ===================================================================
+# Routes — Commit Links
+# ===================================================================
+
+@app.route("/api/v1/commit-links", methods=["POST"])
+@require_auth
+def ingest_commit_link():
+    """Record a commit → trace link."""
+    body = request.get_json(silent=True) or {}
+    project_id = body.get("project_id")
+
+    if not project_id:
+        return jsonify({"error": "project_id is required"}), 400
+    if not body.get("commit_sha"):
+        return jsonify({"error": "commit_sha is required"}), 400
+    if not body.get("trace_ids"):
+        return jsonify({"error": "trace_ids is required"}), 400
+
+    try:
+        commit_sha = service.ingest_commit_link(
+            project_id=project_id,
+            user_id=g.user_id,
+            commit_link_data=body,
+        )
+        return jsonify({"ok": True, "commit_sha": commit_sha}), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/v1/commit-links/<commit_sha>", methods=["GET"])
+@require_auth
+def get_commit_link(commit_sha):
+    """Look up which traces contributed to a commit."""
+    project_id = request.args.get("project_id")
+    if not project_id:
+        return jsonify({"error": "project_id query parameter is required"}), 400
+
+    result = service.get_commit_link_detail(project_id, commit_sha)
+    if result is None:
+        return jsonify({"error": "Commit link not found"}), 404
+    return jsonify(result)
+
+
+# ===================================================================
+# Routes — Blame (AI attribution)
+# ===================================================================
+
+@app.route("/api/v1/blame", methods=["POST"])
+@require_auth
+def blame_file():
+    """Attribute lines of a file to AI traces.
+
+    The client runs ``git blame`` locally and sends the structured result.
+    POST is used because the blame data payload (per-line commit info +
+    content hashes) is too large for query parameters.
+
+    Request body:
+        {
+            "project_id": "my-project",
+            "file_path": "src/utils/parser.ts",
+            "blame_data": [
+                {
+                    "start_line": 10,
+                    "end_line": 25,
+                    "commit_sha": "abc123...",
+                    "parent_sha": "def456...",
+                    "content_hash": "sha256:9f2e8a1b3c4d5e6f",
+                    "timestamp": "2026-02-10T14:30:00Z"
+                }
+            ]
+        }
+
+    Response:
+        {
+            "file_path": "src/utils/parser.ts",
+            "attributions": [ ... ]
+        }
+    """
+    body = request.get_json(silent=True) or {}
+    project_id = body.get("project_id")
+    file_path = body.get("file_path")
+    blame_data = body.get("blame_data")
+
+    if not project_id:
+        return jsonify({"error": "project_id is required"}), 400
+    if not file_path:
+        return jsonify({"error": "file_path is required"}), 400
+    if not isinstance(blame_data, list) or not blame_data:
+        return jsonify({"error": "blame_data must be a non-empty list"}), 400
+
+    result = service.blame_file(
+        project_id=project_id,
+        file_path=file_path,
+        blame_data=blame_data,
+    )
     return jsonify(result)
 
 

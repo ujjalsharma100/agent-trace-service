@@ -16,6 +16,7 @@ import psycopg2.extras
 from flask import g
 
 from model import (
+    CommitLink,
     Project,
     ProjectStats,
     TraceFields,
@@ -292,3 +293,196 @@ def get_trace(project_id: str, trace_id: str) -> dict[str, Any] | None:
         "trace": row["trace_record"],
         "user_id": row["user_id"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Commit Links
+# ---------------------------------------------------------------------------
+
+def insert_commit_link(
+    project_id: str,
+    user_id: str,
+    commit_sha: str,
+    parent_sha: str | None,
+    trace_ids: list[str],
+    files_changed: list[str] | None,
+    committed_at: str | None,
+) -> None:
+    """Insert a commit-trace link (upsert on project_id + commit_sha)."""
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO commit_links (
+                project_id, user_id, commit_sha, parent_sha,
+                trace_ids, files_changed, committed_at
+            ) VALUES (
+                %s, %s, %s, %s,
+                %s, %s, %s
+            )
+            ON CONFLICT (project_id, commit_sha) DO UPDATE SET
+                parent_sha    = EXCLUDED.parent_sha,
+                trace_ids     = EXCLUDED.trace_ids,
+                files_changed = EXCLUDED.files_changed,
+                committed_at  = EXCLUDED.committed_at,
+                user_id       = EXCLUDED.user_id
+            """,
+            (
+                project_id,
+                user_id,
+                commit_sha,
+                parent_sha,
+                json.dumps(trace_ids),
+                json.dumps(files_changed) if files_changed else None,
+                committed_at,
+            ),
+        )
+
+
+def get_commit_link(project_id: str, commit_sha: str) -> dict[str, Any] | None:
+    """Look up a commit link by project + commit SHA."""
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, project_id, user_id, commit_sha, parent_sha,
+                   trace_ids, files_changed, committed_at, created_at
+            FROM commit_links
+            WHERE project_id = %s AND commit_sha = %s
+            LIMIT 1
+            """,
+            (project_id, commit_sha),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "id": str(row["id"]),
+        "project_id": row["project_id"],
+        "user_id": row["user_id"],
+        "commit_sha": row["commit_sha"],
+        "parent_sha": row["parent_sha"],
+        "trace_ids": row["trace_ids"],           # JSONB → Python list
+        "files_changed": row["files_changed"],   # JSONB → Python list or None
+        "committed_at": row["committed_at"].isoformat() if row["committed_at"] else None,
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Attribution queries (blame support)
+# ---------------------------------------------------------------------------
+
+def find_traces_by_ids(project_id: str, trace_ids: list[str]) -> list[dict[str, Any]]:
+    """Fetch specific traces by their IDs.  Returns the full trace_record for each."""
+    if not trace_ids:
+        return []
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT trace_id, trace_record, vcs, tool, files, trace_timestamp
+            FROM traces
+            WHERE project_id = %s AND trace_id = ANY(%s)
+            """,
+            (project_id, trace_ids),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def find_traces_by_revision_and_file(
+    project_id: str,
+    revision: str,
+    file_path: str,
+) -> list[dict[str, Any]]:
+    """Find traces matching a VCS revision that touch a specific file.
+
+    Uses the JSONB vcs->>'revision' field and checks whether the files
+    array contains an entry with the given path.
+    """
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT trace_id, trace_record, vcs, tool, files, trace_timestamp
+            FROM traces
+            WHERE project_id = %s
+              AND vcs->>'revision' = %s
+              AND files @> %s::jsonb
+            ORDER BY trace_timestamp DESC
+            """,
+            (
+                project_id,
+                revision,
+                json.dumps([{"path": file_path}]),
+            ),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def find_traces_in_window(
+    project_id: str,
+    file_path: str,
+    since: str,
+    until: str,
+) -> list[dict[str, Any]]:
+    """Find traces for a file within a timestamp window.
+
+    Used as the fallback search strategy when neither commit links nor
+    exact revision matches are available.
+    """
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT trace_id, trace_record, vcs, tool, files, trace_timestamp
+            FROM traces
+            WHERE project_id = %s
+              AND trace_timestamp >= %s
+              AND trace_timestamp <= %s
+              AND files @> %s::jsonb
+            ORDER BY trace_timestamp DESC
+            LIMIT 100
+            """,
+            (
+                project_id,
+                since,
+                until,
+                json.dumps([{"path": file_path}]),
+            ),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def get_commit_links_by_parent(project_id: str, parent_sha: str) -> list[dict[str, Any]]:
+    """Find all commit links where parent_sha matches."""
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, project_id, user_id, commit_sha, parent_sha,
+                   trace_ids, files_changed, committed_at, created_at
+            FROM commit_links
+            WHERE project_id = %s AND parent_sha = %s
+            ORDER BY created_at DESC
+            """,
+            (project_id, parent_sha),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": str(row["id"]),
+            "project_id": row["project_id"],
+            "user_id": row["user_id"],
+            "commit_sha": row["commit_sha"],
+            "parent_sha": row["parent_sha"],
+            "trace_ids": row["trace_ids"],
+            "files_changed": row["files_changed"],
+            "committed_at": row["committed_at"].isoformat() if row["committed_at"] else None,
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+        for row in rows
+    ]
