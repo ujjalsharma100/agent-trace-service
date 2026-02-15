@@ -451,7 +451,7 @@ def _format_attribution(
         "trace_id": result.trace_id,
     }
 
-    # Add contributor info
+    # Add contributor info (nested and top-level for CLI/display)
     if result.contributor_type or result.model_id:
         contributor: dict[str, Any] = {}
         if result.contributor_type:
@@ -459,6 +459,11 @@ def _format_attribution(
         if result.model_id:
             contributor["model_id"] = result.model_id
         entry["contributor"] = contributor
+        # Top-level model_id / contributor_type so blame output shows model
+        if result.model_id:
+            entry["model_id"] = result.model_id
+        if result.contributor_type:
+            entry["contributor_type"] = result.contributor_type
 
     # Conversation info
     if result.conversation_url:

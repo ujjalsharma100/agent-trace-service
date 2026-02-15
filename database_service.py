@@ -392,6 +392,29 @@ def find_traces_by_ids(project_id: str, trace_ids: list[str]) -> list[dict[str, 
         return [dict(row) for row in cur.fetchall()]
 
 
+def find_traces_by_revision(
+    project_id: str,
+    revision: str,
+) -> list[dict[str, Any]]:
+    """Find all traces matching a VCS revision (no file filter).
+
+    Caller should filter by file in Python for lenient path matching
+    (e.g. trace path "vite.config.js" vs blamed path "frontend/vite.config.js").
+    """
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT trace_id, trace_record, vcs, tool, files, trace_timestamp
+            FROM traces
+            WHERE project_id = %s AND vcs->>'revision' = %s
+            ORDER BY trace_timestamp DESC
+            """,
+            (project_id, revision),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
 def find_traces_by_revision_and_file(
     project_id: str,
     revision: str,
@@ -400,7 +423,8 @@ def find_traces_by_revision_and_file(
     """Find traces matching a VCS revision that touch a specific file.
 
     Uses the JSONB vcs->>'revision' field and checks whether the files
-    array contains an entry with the given path.
+    array contains an entry with the given path. For lenient path matching
+    use find_traces_by_revision() and filter in Python.
     """
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -418,6 +442,32 @@ def find_traces_by_revision_and_file(
                 revision,
                 json.dumps([{"path": file_path}]),
             ),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def find_traces_in_time_window(
+    project_id: str,
+    since: str,
+    until: str,
+) -> list[dict[str, Any]]:
+    """Find all traces in a timestamp window (no file filter).
+
+    Caller should filter by file in Python for lenient path matching.
+    """
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT trace_id, trace_record, vcs, tool, files, trace_timestamp
+            FROM traces
+            WHERE project_id = %s
+              AND trace_timestamp >= %s
+              AND trace_timestamp <= %s
+            ORDER BY trace_timestamp DESC
+            LIMIT 200
+            """,
+            (project_id, since, until),
         )
         return [dict(row) for row in cur.fetchall()]
 

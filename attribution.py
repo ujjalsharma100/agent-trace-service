@@ -46,8 +46,22 @@ WEIGHT_TIMESTAMP = 5       # trace timestamp falls within commit window
 # ---------------------------------------------------------------------------
 
 def _compute_tier(score: float, signals: list[str]) -> int | None:
-    """Map a numeric score + signal list to a confidence tier (1-6) or None."""
+    """Map a numeric score + signal list to a confidence tier (1-6) or None.
+
+    Requires at least one *structural* signal (commit_link, content_hash,
+    revision_parent, revision_ancestor, range_match, range_overlap).
+    Timestamp alone is never sufficient — it would false-positive on every
+    manual edit made within the same 24-hour window as any AI trace.
+    """
     if score <= 0:
+        return None
+
+    # Require at least one structural signal beyond just timestamp
+    _STRUCTURAL = {
+        "commit_link", "content_hash", "revision_parent",
+        "revision_ancestor", "range_match", "range_overlap",
+    }
+    if not any(s in _STRUCTURAL for s in signals):
         return None
 
     # Tier 1 requires both commit_link AND content_hash signals
@@ -160,11 +174,27 @@ def attribute_line(
     if best_trace is None or best_score <= 0:
         return _no_attribution()
 
+    # --- Require some evidence that this trace is the right one ---
+    # Allow attribution when we have: (1) line-range evidence, or
+    # (2) commit_link + content_hash (content proven), or
+    # (3) commit_link + revision_parent (trace was linked to this commit and
+    #     was at parent revision — trace touched this file, we already filtered
+    #     by file; many traces don't store range info).
+    has_range_evidence = "range_match" in best_signals or "range_overlap" in best_signals
+    has_strong_evidence = "commit_link" in best_signals and "content_hash" in best_signals
+    has_commit_and_revision = "commit_link" in best_signals and "revision_parent" in best_signals
+    if not (has_range_evidence or has_strong_evidence or has_commit_and_revision):
+        return _no_attribution()
+
     # --- Determine tier from signals ---
     tier = _compute_tier(best_score, best_signals)
+    if tier is None:
+        # Only weak signals (e.g. timestamp alone) — no attribution
+        return _no_attribution()
+
     confidence = _tier_to_confidence(tier)
 
-    # --- Extract metadata from the winning trace ---
+    # --- Extract metadata from the winning trace (enrich from other candidates if needed) ---
     return _build_result(
         tier=tier,
         confidence=confidence,
@@ -176,12 +206,47 @@ def attribute_line(
         commit_link_match="commit_link" in best_signals,
         content_hash_match="content_hash" in best_signals,
         project_id=project_id,
+        other_candidates=candidates,
     )
 
 
 # ---------------------------------------------------------------------------
 # Candidate trace finder
 # ---------------------------------------------------------------------------
+
+def _trace_touches_file(trace: dict[str, Any], file_path: str) -> bool:
+    """Return True if this trace's files array contains an entry for *file_path*.
+
+    Critical: commit links associate a commit with traces that touched *any*
+    changed file. When blaming file F, we must only consider traces that
+    actually touch F — otherwise we attribute F's lines to e.g. a .gitignore
+    trace from the same commit.
+
+    Uses top-level "files" column first; falls back to trace_record["files"]
+    in case the DB row has files only inside the full record.
+    """
+    files_data = trace.get("files")
+    if isinstance(files_data, str):
+        try:
+            files_data = json.loads(files_data)
+        except (json.JSONDecodeError, TypeError):
+            files_data = []
+    if not files_data or not isinstance(files_data, list):
+        # Fallback: read from trace_record (full trace JSON)
+        tr = trace.get("trace_record")
+        if isinstance(tr, str):
+            try:
+                tr = json.loads(tr)
+            except (json.JSONDecodeError, TypeError):
+                tr = {}
+        if isinstance(tr, dict):
+            files_data = tr.get("files") or []
+        else:
+            files_data = []
+    if not isinstance(files_data, list):
+        return False
+    return _find_matching_file(files_data, file_path) is not None
+
 
 def _find_candidate_traces(
     project_id: str,
@@ -199,7 +264,9 @@ def _find_candidate_traces(
     3. Fallback: query traces in a timestamp window with matching file path.
 
     All strategies are attempted and results are merged (deduplicated by
-    trace_id) so the scoring function can pick the best.
+    trace_id). We then filter to only traces that actually touch *file_path*
+    — commit links can include traces that touched other files in the same
+    commit (e.g. .gitignore), and we must not attribute this file to those.
     """
     seen: set[str] = set()
     candidates: list[dict[str, Any]] = []
@@ -211,25 +278,27 @@ def _find_candidate_traces(
                 seen.add(tid)
                 candidates.append(t)
 
-    # Path A: From commit link (highest priority — most efficient)
+    # Path A: From commit link (may include traces that touched other files only)
     if linked_trace_ids:
         _add(db.find_traces_by_ids(project_id, linked_trace_ids))
 
-    # Path B: From parent revision match
+    # Path B: From parent revision match (no file filter in DB — we filter below
+    # so path matching is lenient, e.g. trace "vite.config.js" vs "frontend/vite.config.js")
     if blame_parent:
-        _add(db.find_traces_by_revision_and_file(project_id, blame_parent, file_path))
+        _add(db.find_traces_by_revision(project_id, blame_parent))
 
-    # Path C: Timestamp window fallback
+    # Path C: Timestamp window fallback (no file filter in DB — filter below for lenient path)
     if blame_timestamp and len(candidates) < 5:
         try:
             ts = datetime.fromisoformat(blame_timestamp)
-            # Search window: 24h before the commit to 1h after
             since = (ts - timedelta(hours=24)).isoformat()
             until = (ts + timedelta(hours=1)).isoformat()
-            _add(db.find_traces_in_window(project_id, file_path, since, until))
+            _add(db.find_traces_in_time_window(project_id, since, until))
         except (ValueError, TypeError):
             logger.debug("Could not parse blame_timestamp: %s", blame_timestamp)
 
+    # Require that every candidate actually touches the blamed file
+    candidates = [t for t in candidates if _trace_touches_file(t, file_path)]
     return candidates
 
 
@@ -309,6 +378,9 @@ def _score_trace(
             files_data = json.loads(files_data)
         except (json.JSONDecodeError, TypeError):
             files_data = []
+    if not isinstance(files_data, list) or not files_data:
+        # Fallback: files may only be in trace_record (e.g. DB column empty)
+        files_data = trace_record.get("files") if isinstance(trace_record, dict) else []
     if not isinstance(files_data, list):
         files_data = []
 
@@ -375,8 +447,13 @@ def _build_result(
     commit_link_match: bool,
     content_hash_match: bool,
     project_id: str,
+    other_candidates: list[dict[str, Any]] | None = None,
 ) -> AttributionResult:
-    """Build a full AttributionResult from the winning trace."""
+    """Build a full AttributionResult from the winning trace.
+
+    If model_id or conversation_url are missing, tries to fill from
+    other_candidates (e.g. other commit-linked traces).
+    """
 
     trace_record = trace.get("trace_record")
     if isinstance(trace_record, str):
@@ -397,7 +474,7 @@ def _build_result(
     if not isinstance(tool_data, dict):
         tool_data = trace_record.get("tool")
 
-    # Extract file entry & range
+    # Extract file entry & range (prefer full trace_record["files"] for model/conversation)
     files_data = trace.get("files")
     if isinstance(files_data, str):
         try:
@@ -406,13 +483,18 @@ def _build_result(
             files_data = []
     if not isinstance(files_data, list):
         files_data = []
+    # Use trace_record["files"] when top-level files is empty — DB column may be minimal
+    if not files_data and trace_record:
+        files_data = trace_record.get("files") or []
+    if not isinstance(files_data, list):
+        files_data = []
 
     matched_file = _find_matching_file(files_data, file_path)
     matched_range = None
     if matched_file:
         matched_range = _get_best_range(matched_file, line_number)
 
-    # Extract model_id and conversation info from the trace record
+    # Extract model_id and conversation info — don't break until we have BOTH
     model_id = None
     conversation_url = None
     contributor_type = "unknown"
@@ -420,15 +502,52 @@ def _build_result(
     if matched_file:
         conversations = matched_file.get("conversations", [])
         for conv in conversations:
-            contributor = conv.get("contributor", {})
-            if contributor.get("type"):
+            if not isinstance(conv, dict):
+                continue
+            contributor = conv.get("contributor") or {}
+            if contributor.get("type") and not contributor_type:
                 contributor_type = contributor["type"]
-            if contributor.get("model_id"):
+            if contributor.get("model_id") and not model_id:
                 model_id = contributor["model_id"]
             conv_url = conv.get("url")
-            if conv_url:
+            if conv_url and not conversation_url:
                 conversation_url = conv_url
-            if model_id:
+            # Only break when we have both
+            if model_id and conversation_url:
+                break
+
+    # Fallback: search ALL file entries in this trace for model/conversation
+    if not model_id or not conversation_url:
+        for fe in files_data:
+            if not isinstance(fe, dict) or fe is matched_file:
+                continue
+            for conv in fe.get("conversations", []):
+                if not isinstance(conv, dict):
+                    continue
+                contributor = conv.get("contributor") or {}
+                if contributor.get("model_id") and not model_id:
+                    model_id = contributor["model_id"]
+                if contributor.get("type") and contributor_type == "unknown":
+                    contributor_type = contributor["type"]
+                if conv.get("url") and not conversation_url:
+                    conversation_url = conv["url"]
+            if model_id and conversation_url:
+                break
+
+    # Enrich from other candidate traces if still missing
+    if (not model_id or not conversation_url) and other_candidates:
+        best_trace_id = trace.get("trace_id")
+        for t in other_candidates:
+            if t.get("trace_id") == best_trace_id:
+                continue
+            m, u, ct = _extract_meta_from_trace(t, file_path)
+            if not model_id and m:
+                model_id = m
+            if not conversation_url and u:
+                conversation_url = u
+            if ct and contributor_type == "unknown":
+                contributor_type = ct
+            if model_id and conversation_url:
                 break
 
     # Try to look up conversation content from the database
@@ -455,6 +574,44 @@ def _build_result(
         commit_link_match=commit_link_match,
         signals=signals,
     )
+
+
+def _extract_meta_from_trace(
+    trace: dict[str, Any],
+    file_path: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Extract (model_id, conversation_url, contributor_type) from a trace.
+
+    Searches all file entries; file_path is used only to prefer the matching
+    file entry. Returns (None, None, None) for missing values.
+    """
+    model_id = None
+    conversation_url = None
+    contributor_type = None
+    files_data = trace.get("files")
+    if isinstance(files_data, str):
+        try:
+            files_data = json.loads(files_data)
+        except (json.JSONDecodeError, TypeError):
+            files_data = []
+    if not isinstance(files_data, list):
+        return (None, None, None)
+    for fe in files_data:
+        if not isinstance(fe, dict):
+            continue
+        for conv in fe.get("conversations", []):
+            if not isinstance(conv, dict):
+                continue
+            contributor = conv.get("contributor") or {}
+            if contributor.get("model_id") and not model_id:
+                model_id = contributor["model_id"]
+            if contributor.get("type") and not contributor_type:
+                contributor_type = contributor["type"]
+            if conv.get("url") and not conversation_url:
+                conversation_url = conv["url"]
+        if model_id and conversation_url:
+            return (model_id, conversation_url, contributor_type)
+    return (model_id, conversation_url, contributor_type)
 
 
 def _find_matching_file(
