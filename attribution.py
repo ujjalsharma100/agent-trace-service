@@ -665,7 +665,7 @@ def _collect_ranges(file_entry: dict[str, Any]) -> list[tuple[int, int]]:
         except (ValueError, TypeError):
             pass
 
-    # Ranges inside conversations
+    # Ranges inside conversations (including conv["ranges"][] — trace.py format)
     for conv in file_entry.get("conversations", []):
         if not isinstance(conv, dict):
             continue
@@ -674,6 +674,12 @@ def _collect_ranges(file_entry: dict[str, Any]) -> list[tuple[int, int]]:
                 ranges.append((int(conv["start_line"]), int(conv["end_line"])))
             except (ValueError, TypeError):
                 pass
+        for r in conv.get("ranges", []):
+            if isinstance(r, dict) and "start_line" in r and "end_line" in r:
+                try:
+                    ranges.append((int(r["start_line"]), int(r["end_line"])))
+                except (ValueError, TypeError):
+                    pass
 
     # Ranges inside changes
     for change in file_entry.get("changes", []):
@@ -727,10 +733,22 @@ def _extract_content_hash(
 
     Content hashes can appear:
     - At the file entry level: file_entry["content_hash"]
+    - Inside conversation ranges: conv["ranges"][i]["content_hash"] (trace.py format)
     - Inside conversations: conv["content_hash"]
     - Inside changes: change["content_hash"]
     """
-    # Check conversations first (most specific)
+    # Check conversation ranges first (most specific — trace.py stores hashes here)
+    for conv in file_entry.get("conversations", []):
+        if not isinstance(conv, dict):
+            continue
+        for r in conv.get("ranges", []):
+            if not isinstance(r, dict):
+                continue
+            ch = r.get("content_hash")
+            if ch and _range_contains(r, line_number):
+                return ch
+
+    # Conversation-level and change-level content_hash
     for conv in file_entry.get("conversations", []):
         if not isinstance(conv, dict):
             continue
@@ -738,7 +756,6 @@ def _extract_content_hash(
         if ch and _range_contains(conv, line_number):
             return ch
 
-    # Check changes
     for change in file_entry.get("changes", []):
         if not isinstance(change, dict):
             continue
