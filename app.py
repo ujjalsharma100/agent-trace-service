@@ -72,6 +72,7 @@ def root():
             "get_commit_link": "GET /api/v1/commit-links/<commitSha>?project_id=<id>",
             "blame_file": "POST /api/v1/blame",
             "sync_conversation": "POST /api/v1/conversations/sync",
+            "get_conversation_content": "GET /api/v1/conversations/content?project_id=<id>&url=<url>",
             "project_info": "GET /api/v1/projects/<projectId>",
             "create_project": "POST /api/v1/projects",
             "generate_token": "POST /api/v1/tokens/generate",
@@ -335,6 +336,27 @@ def sync_conversation():
         conversation_contents=conversation_contents,
     )
     return jsonify({"ok": True}), 200
+
+
+@app.route("/api/v1/conversations/content", methods=["GET"])
+@require_auth
+def get_conversation_content():
+    """
+    Get full conversation content by URL (for viewer / blame UI).
+
+    Query params: project_id, url (the conversation URL, e.g. file:///path or any key used in conversation_contents).
+    Returns { "content": "..." } or 404 if not found.
+    """
+    project_id = request.args.get("project_id")
+    url = request.args.get("url")
+    if not project_id:
+        return jsonify({"error": "project_id is required"}), 400
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+    content = db_service.get_conversation_content(project_id, url)
+    if content is None:
+        return jsonify({"error": "Conversation not found"}), 404
+    return jsonify({"content": content}), 200
 
 
 # ===================================================================

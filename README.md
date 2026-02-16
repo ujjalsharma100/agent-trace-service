@@ -2,7 +2,9 @@
 
 A simple Flask application that collects and stores coding agent traces from tools like **Cursor** and **Claude Code**. Traces are sent to this centralised service and stored in PostgreSQL, enabling cross-project visibility, team collaboration, and persistent trace history.
 
-This implementation is built to the [Agent Trace](https://agent-trace.dev/) specification. 
+This implementation is built to the [Agent Trace](https://agent-trace.dev/) specification.
+
+For the **local file viewer** (browse files, git + agent-trace blame), see the [repo root README](../README.md#file-viewer-optional) or [agent-trace-viewer](../agent-trace-viewer/README.md).
 
 ## Project Structure
 
