@@ -105,6 +105,7 @@ def attribute_line(
     blame_parent: str | None,
     content_hash: str | None,
     blame_timestamp: str | None,
+    ledger: dict[str, Any] | None = None,
 ) -> AttributionResult:
     """Attribute a single line of code to an AI trace.
 
@@ -124,12 +125,39 @@ def attribute_line(
         SHA-256 prefix of the normalized content of the blamed lines.
     blame_timestamp : str | None
         ISO-8601 author date of *blame_commit*.
+    ledger : dict | None
+        Pre-computed attribution ledger for this commit (if available).
 
     Returns
     -------
     AttributionResult
         Contains the best matching trace, tier, confidence, and signals.
     """
+
+    # --- Ledger-first path: deterministic attribution ---
+    if ledger and file_path in (ledger.get("files") or {}):
+        file_ledger = ledger["files"][file_path]
+        for la in file_ledger.get("line_attributions", []):
+            la_start = la.get("start_line", 0)
+            la_end = la.get("end_line", 0)
+            if la_start <= line_number <= la_end:
+                attr_type = la.get("type", "unknown")
+                is_ai = attr_type == "ai"
+                is_mixed = attr_type == "mixed"
+                return AttributionResult(
+                    tier=1 if is_ai else (3 if is_mixed else None),
+                    confidence=1.0 if is_ai else (0.95 if is_mixed else 0.0),
+                    trace_id=la.get("trace_id"),
+                    conversation_url=la.get("conversation_url"),
+                    conversation_content=None,
+                    contributor_type=attr_type,
+                    model_id=la.get("model_id"),
+                    tool=None,
+                    matched_range={"start_line": la_start, "end_line": la_end},
+                    content_hash_match=is_ai,
+                    commit_link_match=True,
+                    signals=["ledger"],
+                )
 
     # --- Signal 1: Commit link lookup ---
     commit_link = db.get_commit_link(project_id, blame_commit)

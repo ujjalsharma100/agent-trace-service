@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS commit_links (
     files_changed   JSONB,                   -- ["src/foo.ts", "src/bar.py", ...]
 
     committed_at    TIMESTAMPTZ,             -- git commit author date
+    ledger          JSONB,                   -- attribution ledger (per-line attribution)
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     UNIQUE (project_id, commit_sha)

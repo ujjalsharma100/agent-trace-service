@@ -70,6 +70,7 @@ def root():
             "get_trace": "GET /api/v1/traces/<traceId>?project_id=<id>",
             "ingest_commit_link": "POST /api/v1/commit-links",
             "get_commit_link": "GET /api/v1/commit-links/<commitSha>?project_id=<id>",
+            "get_ledger": "GET /api/v1/ledgers/<commitSha>?project_id=<id>",
             "blame_file": "POST /api/v1/blame",
             "sync_conversation": "POST /api/v1/conversations/sync",
             "get_conversation_content": "GET /api/v1/conversations/content?project_id=<id>&url=<url>",
@@ -256,6 +257,24 @@ def get_commit_link(commit_sha):
     if result is None:
         return jsonify({"error": "Commit link not found"}), 404
     return jsonify(result)
+
+
+# ===================================================================
+# Routes — Ledgers
+# ===================================================================
+
+@app.route("/api/v1/ledgers/<commit_sha>", methods=["GET"])
+@require_auth
+def get_ledger(commit_sha):
+    """Look up the attribution ledger for a commit."""
+    project_id = request.args.get("project_id")
+    if not project_id:
+        return jsonify({"error": "project_id query parameter is required"}), 400
+
+    ledger = db_service.get_ledger(project_id, commit_sha)
+    if ledger is None:
+        return jsonify({"error": "Ledger not found"}), 404
+    return jsonify(ledger)
 
 
 # ===================================================================

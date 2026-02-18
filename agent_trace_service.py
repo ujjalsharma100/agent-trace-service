@@ -253,6 +253,7 @@ def ingest_commit_link(
     trace_ids = commit_link_data.get("trace_ids", [])
     files_changed = commit_link_data.get("files_changed")
     committed_at = commit_link_data.get("committed_at")
+    ledger = commit_link_data.get("ledger")
 
     if not commit_sha:
         raise ValueError("commit_sha is required")
@@ -268,6 +269,7 @@ def ingest_commit_link(
         trace_ids=trace_ids,
         files_changed=files_changed,
         committed_at=committed_at,
+        ledger=ledger,
     )
     return commit_sha
 
@@ -377,6 +379,22 @@ def blame_file(
 
         if start_line is None or end_line is None or not commit_sha:
             logger.debug("Skipping incomplete blame segment: %s", segment)
+            continue
+
+        # --- Ledger-first path ---
+        ledger = db.get_ledger(project_id, commit_sha)
+        if ledger:
+            result = attr.attribute_line(
+                project_id=project_id,
+                file_path=file_path,
+                line_number=(start_line + end_line) // 2,
+                blame_commit=commit_sha,
+                blame_parent=parent_sha,
+                content_hash=content_hash,
+                blame_timestamp=timestamp,
+                ledger=ledger,
+            )
+            raw_results.append((segment, result))
             continue
 
         # Use the midpoint of the range as the representative line

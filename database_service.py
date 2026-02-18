@@ -307,6 +307,7 @@ def insert_commit_link(
     trace_ids: list[str],
     files_changed: list[str] | None,
     committed_at: str | None,
+    ledger: dict[str, Any] | None = None,
 ) -> None:
     """Insert a commit-trace link (upsert on project_id + commit_sha)."""
     db = get_db()
@@ -315,16 +316,17 @@ def insert_commit_link(
             """
             INSERT INTO commit_links (
                 project_id, user_id, commit_sha, parent_sha,
-                trace_ids, files_changed, committed_at
+                trace_ids, files_changed, committed_at, ledger
             ) VALUES (
                 %s, %s, %s, %s,
-                %s, %s, %s
+                %s, %s, %s, %s
             )
             ON CONFLICT (project_id, commit_sha) DO UPDATE SET
                 parent_sha    = EXCLUDED.parent_sha,
                 trace_ids     = EXCLUDED.trace_ids,
                 files_changed = EXCLUDED.files_changed,
                 committed_at  = EXCLUDED.committed_at,
+                ledger        = EXCLUDED.ledger,
                 user_id       = EXCLUDED.user_id
             """,
             (
@@ -335,6 +337,7 @@ def insert_commit_link(
                 json.dumps(trace_ids),
                 json.dumps(files_changed) if files_changed else None,
                 committed_at,
+                json.dumps(ledger) if ledger else None,
             ),
         )
 
@@ -346,7 +349,7 @@ def get_commit_link(project_id: str, commit_sha: str) -> dict[str, Any] | None:
         cur.execute(
             """
             SELECT id, project_id, user_id, commit_sha, parent_sha,
-                   trace_ids, files_changed, committed_at, created_at
+                   trace_ids, files_changed, committed_at, ledger, created_at
             FROM commit_links
             WHERE project_id = %s AND commit_sha = %s
             LIMIT 1
@@ -367,8 +370,28 @@ def get_commit_link(project_id: str, commit_sha: str) -> dict[str, Any] | None:
         "trace_ids": row["trace_ids"],           # JSONB → Python list
         "files_changed": row["files_changed"],   # JSONB → Python list or None
         "committed_at": row["committed_at"].isoformat() if row["committed_at"] else None,
+        "ledger": row["ledger"],                 # JSONB → Python dict or None
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
     }
+
+
+def get_ledger(project_id: str, commit_sha: str) -> dict[str, Any] | None:
+    """Look up the attribution ledger for a commit. Returns the ledger dict or None."""
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT ledger
+            FROM commit_links
+            WHERE project_id = %s AND commit_sha = %s AND ledger IS NOT NULL
+            LIMIT 1
+            """,
+            (project_id, commit_sha),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return row["ledger"]  # JSONB → Python dict
 
 
 # ---------------------------------------------------------------------------
