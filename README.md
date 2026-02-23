@@ -261,11 +261,6 @@ The client runs `git blame --porcelain` locally and sends one entry per blame se
 | Param | Description |
 |-------|-------------|
 | `project_id` | **(required)** Project identifier |
-| `session_id` | Filter by session |
-| `conversation_id` | Filter by conversation |
-| `hook_event` | Filter by event type (`afterFileEdit`, `sessionStart`, etc.) |
-| `tool_name` | Filter by tool (`cursor`, `claude-code`) |
-| `model_id` | Filter by model |
 | `since` | ISO timestamp — traces after this time |
 | `until` | ISO timestamp — traces before this time |
 | `limit` | Max results (default: 50, max: 200) |
