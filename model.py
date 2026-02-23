@@ -108,6 +108,7 @@ class AttributionResult:
     tier: int | None                      # 1-6, None if no attribution
     confidence: float                     # 0.0 - 1.0
     trace_id: str | None
+    timestamp: str | None                 # ISO-8601 timestamp from trace
     conversation_url: str | None
     conversation_content: str | None      # full transcript if available
     contributor_type: str | None          # "ai", "human", "mixed", "unknown"
@@ -117,6 +118,8 @@ class AttributionResult:
     content_hash_match: bool
     commit_link_match: bool
     signals: list[str]                    # ["commit_link", "content_hash", ...]
+    source: str | None                    # "ledger" or None (heuristic)
+    attribution_label: str | None         # "AI", "Human", "Mixed" (from ledger)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -129,6 +132,8 @@ class AttributionResult:
             "commit_link_match": self.commit_link_match,
             "signals": self.signals,
         }
+        if self.timestamp is not None:
+            d["timestamp"] = self.timestamp
         if self.conversation_url is not None:
             d["conversation_url"] = self.conversation_url
         if self.conversation_content is not None:
@@ -137,4 +142,8 @@ class AttributionResult:
             d["tool"] = self.tool
         if self.matched_range is not None:
             d["matched_range"] = self.matched_range
+        if self.source is not None:
+            d["source"] = self.source
+        if self.attribution_label is not None:
+            d["attribution_label"] = self.attribution_label
         return d

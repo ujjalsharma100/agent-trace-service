@@ -352,6 +352,8 @@ def blame_file(
                     "tier": 1-6 or null,
                     "confidence": 0.0-1.0,
                     "trace_id": "..." or null,
+                    "timestamp": "ISO-8601" or null,
+                    "commit_sha": "..." or null,
                     "contributor": {"type": "ai", "model_id": "..."},
                     "conversation_url": "..." or null,
                     "conversation_summary": "first N chars..." or null,
@@ -359,6 +361,8 @@ def blame_file(
                     "signals": [...],
                     "commit_link_match": bool,
                     "content_hash_match": bool,
+                    "source": "ledger" or null,
+                    "attribution_label": "AI"|"Human"|"Mixed" or null,
                 }
             ]
         }
@@ -469,6 +473,14 @@ def _format_attribution(
         "trace_id": result.trace_id,
     }
 
+    # Timestamp from trace
+    if result.timestamp:
+        entry["timestamp"] = result.timestamp
+
+    # Commit SHA from the blame segment
+    if segment.get("commit_sha"):
+        entry["commit_sha"] = segment["commit_sha"]
+
     # Add contributor info (nested and top-level for CLI/display)
     if result.contributor_type or result.model_id:
         contributor: dict[str, Any] = {}
@@ -500,5 +512,11 @@ def _format_attribution(
     entry["signals"] = result.signals
     entry["commit_link_match"] = result.commit_link_match
     entry["content_hash_match"] = result.content_hash_match
+
+    # Ledger source info
+    if result.source:
+        entry["source"] = result.source
+    if result.attribution_label:
+        entry["attribution_label"] = result.attribution_label
 
     return entry

@@ -144,19 +144,59 @@ def attribute_line(
                 attr_type = la.get("type", "unknown")
                 is_ai = attr_type == "ai"
                 is_mixed = attr_type == "mixed"
+                attr_label = {"ai": "AI", "human": "Human", "mixed": "Mixed"}.get(
+                    attr_type, attr_type,
+                )
+
+                # Look up trace from DB to get tool and timestamp
+                # (ledger stores trace_id but not tool/timestamp)
+                trace_tool = None
+                trace_timestamp = None
+                ledger_trace_id = la.get("trace_id")
+                if ledger_trace_id and (is_ai or is_mixed):
+                    try:
+                        traces = db.find_traces_by_ids(
+                            project_id, [ledger_trace_id],
+                        )
+                        if traces:
+                            t = traces[0]
+                            trace_tool = t.get("tool")
+                            if isinstance(trace_tool, str):
+                                try:
+                                    trace_tool = json.loads(trace_tool)
+                                except (json.JSONDecodeError, TypeError):
+                                    trace_tool = None
+                            trace_rec = t.get("trace_record")
+                            if isinstance(trace_rec, str):
+                                try:
+                                    trace_rec = json.loads(trace_rec)
+                                except (json.JSONDecodeError, TypeError):
+                                    trace_rec = {}
+                            if isinstance(trace_rec, dict):
+                                if not trace_tool:
+                                    trace_tool = trace_rec.get("tool")
+                                trace_timestamp = trace_rec.get("timestamp")
+                            if not trace_timestamp:
+                                trace_timestamp = t.get("trace_timestamp")
+                    except Exception:
+                        pass  # Non-critical — don't fail attribution
+
                 return AttributionResult(
                     tier=1 if is_ai else (3 if is_mixed else None),
                     confidence=1.0 if is_ai else (0.95 if is_mixed else 0.0),
-                    trace_id=la.get("trace_id"),
+                    trace_id=ledger_trace_id,
+                    timestamp=trace_timestamp,
                     conversation_url=la.get("conversation_url"),
                     conversation_content=None,
                     contributor_type=attr_type,
                     model_id=la.get("model_id"),
-                    tool=None,
+                    tool=trace_tool,
                     matched_range={"start_line": la_start, "end_line": la_end},
                     content_hash_match=is_ai,
                     commit_link_match=True,
                     signals=["ledger"],
+                    source="ledger",
+                    attribution_label=attr_label,
                 )
 
     # --- Signal 1: Commit link lookup ---
@@ -451,6 +491,7 @@ def _no_attribution() -> AttributionResult:
         tier=None,
         confidence=0.0,
         trace_id=None,
+        timestamp=None,
         conversation_url=None,
         conversation_content=None,
         contributor_type=None,
@@ -460,6 +501,8 @@ def _no_attribution() -> AttributionResult:
         content_hash_match=False,
         commit_link_match=False,
         signals=[],
+        source=None,
+        attribution_label=None,
     )
 
 
@@ -588,10 +631,14 @@ def _build_result(
         except Exception:
             pass  # Non-critical — don't fail attribution over this
 
+    # Extract timestamp from trace record
+    trace_timestamp = trace.get("trace_timestamp") or trace_record.get("timestamp")
+
     return AttributionResult(
         tier=tier,
         confidence=confidence,
         trace_id=trace.get("trace_id"),
+        timestamp=trace_timestamp,
         conversation_url=conversation_url,
         conversation_content=conversation_content,
         contributor_type=contributor_type,
@@ -601,6 +648,8 @@ def _build_result(
         content_hash_match=content_hash_match,
         commit_link_match=commit_link_match,
         signals=signals,
+        source=None,
+        attribution_label=None,
     )
 
 
