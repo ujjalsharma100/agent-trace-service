@@ -12,9 +12,8 @@ For the **local file viewer** (browse files, git + agent-trace blame), see the [
 agent-trace-service/
 ├── app.py                    # Flask endpoints (thin routing layer)
 ├── agent_trace_service.py    # Application / business logic
-├── attribution.py            # AI blame / attribution engine (ledger-first + heuristic scoring)
 ├── database_service.py       # All database operations (psycopg2)
-├── model.py                  # Dataclasses (Project, TraceFields, AttributionResult, etc.)
+├── model.py                  # Dataclasses (Project, TraceFields, CommitLink, etc.)
 ├── init_db.py                # CLI tool to create / drop / reset tables
 ├── sql/
 │   ├── projects.sql          # Projects table DDL
@@ -78,28 +77,11 @@ gunicorn app:app -b 0.0.0.0:5000
 
 The service runs on `http://localhost:5000` by default.
 
-## AI Blame / Attribution
+## Attribution ledgers
 
-The service provides **AI attribution** for code: given a file and git-blame data (which commit introduced each line), it attributes lines to AI traces. This powers the `agent-trace blame` command in the CLI (remote mode).
+**Blame and attribution run entirely in the CLI** (`agent-trace blame`) using ledgers stored under `.agent-trace/` and/or fetched via `GET /api/v1/ledgers/<commit_sha>`. The service persists ledgers when the CLI posts commit links: the **attribution ledger** is a deterministic per-line map built at commit time by the CLI's post-commit hook (AI / human / mixed from line-hash matching against traces).
 
-### Ledger-first attribution
-
-The primary attribution mechanism is the **attribution ledger** — a deterministic per-line map built at commit time by the CLI's post-commit hook. The ledger records which lines were written by AI, by a human, or are mixed (AI-written then human-edited), based on per-line content hash matching against trace records.
-
-When the CLI sends a commit link with a ledger attached, the service stores it as JSONB in the `commit_links` table. During blame, the service checks the ledger first:
-
-- If a ledger exists for the commit and covers the file, attribution is returned directly with **confidence 1.0** (no heuristic needed).
-- If no ledger exists, the service falls back to the heuristic scoring engine.
-
-The ledger endpoint (`GET /api/v1/ledgers/<commit_sha>`) allows the CLI to fetch ledgers for remote-mode blame.
-
-### Heuristic fallback
-
-For commits that predate the ledger system, the service uses a weighted scoring engine:
-
-- **Commit links** — When the CLI's post-commit hook runs, it records which traces were "active" for that commit. Those links are stored in `commit_links` and are the strongest heuristic signal.
-- **Attribution engine** — `attribution.py` finds candidate traces (by commit link, revision match, or time window), scores them using weighted signals (commit link, content hash, revision, line range, timestamp), and maps the best match to a tier and confidence.
-- **Tiers** — Tier 1 is "provably certain" (commit link + content hash); tiers 2–6 represent decreasing confidence. See [ATTRIBUTION-ALGORITHM.md](ATTRIBUTION-ALGORITHM.md) for the full algorithm (signals, weights, gating, and service vs CLI behavior).
+The ledger endpoint (`GET /api/v1/ledgers/<commit_sha>`) returns stored ledger JSON for a commit, or 404 if none was ingested.
 
 ## Database Management
 
@@ -220,35 +202,6 @@ curl -X POST http://localhost:5000/api/v1/tokens/generate \
 }
 ```
 
-### Blame (AI attribution)
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `POST` | `/api/v1/blame` | Yes | Attribute file lines to AI traces. The service checks the ledger first for deterministic attribution; falls back to heuristic scoring for commits without a ledger. |
-
-The client runs `git blame --porcelain` locally and sends one entry per blame segment (consecutive lines from the same commit). Each segment includes `start_line`, `end_line`, `commit_sha`, `parent_sha`, `content_hash`, and `timestamp`. The service returns merged attributions (adjacent segments with the same trace and tier are combined).
-
-**Request body:**
-
-```json
-{
-  "project_id": "my-project",
-  "file_path": "src/utils/parser.ts",
-  "blame_data": [
-    {
-      "start_line": 10,
-      "end_line": 25,
-      "commit_sha": "abc123...",
-      "parent_sha": "def456...",
-      "content_hash": "sha256:9f2e8a1b3c4d5e6f",
-      "timestamp": "2026-02-10T14:30:00Z"
-    }
-  ]
-}
-```
-
-**Response:** `{ "file_path": "...", "attributions": [ { "start_line", "end_line", "tier", "confidence", "trace_id", "model_id", "conversation_url", "signals", ... } ] }`
-
 ### Conversations
 
 | Method | Path | Auth | Description |
@@ -347,15 +300,14 @@ Used by the CLI when the agent has finished a response (Cursor `afterAgentRespon
 app.py                     ← HTTP endpoints (Flask routes)
     │
     ▼
-agent_trace_service.py     ← Business logic, token mgmt, trace/commit-link ingest, blame orchestration
+agent_trace_service.py     ← Business logic, token mgmt, trace/commit-link ingest
     │
-    ├── attribution.py     ← Blame: ledger-first attribution + heuristic scoring fallback
     │
     ▼
 database_service.py        ← All SQL queries (psycopg2), ledger storage/retrieval
     │
     ▼
-model.py                   ← Dataclasses (Project, TraceFields, CommitLink, AttributionResult, etc.)
+model.py                   ← Dataclasses (Project, TraceFields, CommitLink, etc.)
 ```
 
 ## License
