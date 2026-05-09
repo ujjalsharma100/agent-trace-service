@@ -2,8 +2,8 @@
 Application logic for agent-trace-service — pure datastore operations.
 
 This module sits between the Flask routes (app.py) and the database layer
-(database_service.py).  It owns token management and orchestrates bulk
-upsert operations for the sync protocol.
+(database_service.py).  It owns token issuance / verification and
+orchestrates bulk upsert operations for the sync protocol.
 
 NO domain logic (attribution, blame, scoring, summaries) lives here.
 """
@@ -12,14 +12,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import hmac
 import json
 import os
-import time
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 
-from model import TraceFields
+from model import TokenContext, TraceFields
 import database_service as db
 
 
@@ -27,39 +26,96 @@ import database_service as db
 # Configuration
 # ---------------------------------------------------------------------------
 
-AUTH_SECRET = os.environ.get("AUTH_SECRET", "dev-secret")
+# Admin secret guards token issuance / revocation. In dev compose this is
+# set explicitly; in production it must be a strong random string.
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "dev-admin-secret")
+
+# Bumped whenever sql/ contents change. Source of truth for /health and
+# /api/v1/version. Kept in sync with init_db.SCHEMA_VERSION.
+SCHEMA_VERSION = "002-multitenancy"
+
+# Build SHA — populated by deploy / Dockerfile via env. Falls back to "dev".
+BUILD_SHA = os.environ.get("BUILD_SHA", "dev")
+
+# Largest blob accepted by POST /api/v1/blobs (raw body). 10 MiB default.
+BLOB_MAX_BYTES = int(os.environ.get("BLOB_MAX_BYTES", str(10 * 1024 * 1024)))
+
+# Token shape: ``at_<32 url-safe chars>``. The 8-char prefix (``at_xxxxx``)
+# is stored verbatim for log / UI display; only the SHA-256 of the full
+# token is persisted.
+TOKEN_PREFIX_PLAIN = "at_"
+TOKEN_DISPLAY_PREFIX_LEN = 8
 
 
 # ---------------------------------------------------------------------------
-# Token helpers
+# Token helpers (opaque, hash-stored)
 # ---------------------------------------------------------------------------
 
-def _sign(payload: str) -> str:
-    return hmac.new(
-        AUTH_SECRET.encode(), payload.encode(), hashlib.sha256,
-    ).hexdigest()[:16]
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def generate_token(user_id: str) -> str:
-    raw = json.dumps({"user_id": user_id, "iat": int(time.time())})
-    encoded = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
-    return f"{encoded}.{_sign(encoded)}"
+def _mint_token() -> str:
+    return f"{TOKEN_PREFIX_PLAIN}{secrets.token_urlsafe(32)}"
 
 
-def decode_token(token: str) -> str | None:
-    try:
-        encoded, sig = token.split(".", 1)
-        if _sign(encoded) != sig:
-            return None
-        padded = encoded + "=" * (-len(encoded) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded).decode())
-        return payload.get("user_id")
-    except Exception:
+def issue_token(
+    *,
+    org_id: str,
+    project_id: str | None,
+    scopes: list[str] | None,
+    name: str | None,
+) -> dict[str, Any]:
+    """Mint and persist a new opaque token. Returns the plaintext exactly once."""
+    token = _mint_token()
+    token_hash = _hash_token(token)
+    prefix = token[:TOKEN_DISPLAY_PREFIX_LEN]
+    eff_scopes = list(scopes) if scopes else ["read", "write"]
+    token_id = db.insert_token(
+        org_id=org_id,
+        project_id=project_id,
+        scopes=eff_scopes,
+        token_hash=token_hash,
+        prefix=prefix,
+        name=name,
+    )
+    return {
+        "id": token_id,
+        "token": token,
+        "prefix": prefix,
+        "org_id": org_id,
+        "project_id": project_id,
+        "scopes": eff_scopes,
+        "name": name,
+        "note": (
+            "Store this token securely — the plaintext is shown exactly once. "
+            "Use it as: Authorization: Bearer <token>."
+        ),
+    }
+
+
+def verify_token(token: str) -> tuple[dict[str, Any], bool]:
+    if not token or not token.startswith(TOKEN_PREFIX_PLAIN):
+        return {"valid": False, "error": "Invalid token format"}, False
+    ctx = db.lookup_token_by_hash(_hash_token(token))
+    if ctx is None:
+        return {"valid": False, "error": "Invalid or revoked token"}, False
+    return {
+        "valid": True,
+        "org_id": ctx.org_id,
+        "project_id": ctx.project_id_scope,
+        "scopes": ctx.scopes,
+    }, True
+
+
+def resolve_token(token: str) -> TokenContext | None:
+    if not token or not token.startswith(TOKEN_PREFIX_PLAIN):
         return None
+    return db.lookup_token_by_hash(_hash_token(token))
 
 
 # ---------------------------------------------------------------------------
-# Health
+# Health / version
 # ---------------------------------------------------------------------------
 
 def health_check() -> dict[str, Any]:
@@ -67,28 +123,29 @@ def health_check() -> dict[str, Any]:
     return {
         "status": "ok",
         "db": "connected",
+        "schema_version": SCHEMA_VERSION,
+        "build": BUILD_SHA,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
-# ---------------------------------------------------------------------------
-# Tokens (public API)
-# ---------------------------------------------------------------------------
-
-def handle_generate_token(user_id: str) -> dict[str, Any]:
-    token = generate_token(user_id)
+def version_info() -> dict[str, Any]:
     return {
-        "token": token,
-        "user_id": user_id,
-        "note": "Store this token securely. Use it as: Authorization: Bearer <token>",
+        "schema_version": SCHEMA_VERSION,
+        "build": BUILD_SHA,
+        "name": "agent-trace-service",
     }
 
 
-def handle_verify_token(token: str) -> tuple[dict[str, Any], bool]:
-    user_id = decode_token(token)
-    if not user_id:
-        return {"valid": False, "error": "Invalid token"}, False
-    return {"valid": True, "user_id": user_id}, True
+# ---------------------------------------------------------------------------
+# Project guard
+# ---------------------------------------------------------------------------
+
+def assert_project_in_token_scope(ctx: TokenContext, project_id: str) -> bool:
+    """Project-scoped tokens may only act on their bound project."""
+    if ctx.project_id_scope is None:
+        return True
+    return ctx.project_id_scope == project_id
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +172,7 @@ def _extract_fields(trace: dict[str, Any]) -> TraceFields:
 
 
 def sync_upsert_traces(
+    org_id: str,
     project_id: str,
     user_id: str,
     items: list[dict[str, Any]],
@@ -122,12 +180,12 @@ def sync_upsert_traces(
     """Upsert a batch of traces.  Returns count of items processed."""
     if not items:
         return 0
-    db.ensure_project(project_id)
+    db.ensure_project(org_id, project_id)
     for item in items:
         if not item.get("id") or not item.get("timestamp"):
             continue
         fields = _extract_fields(item)
-        db.insert_trace(project_id, user_id, fields)
+        db.insert_trace(org_id, project_id, user_id, fields)
     return len(items)
 
 
@@ -136,6 +194,7 @@ def sync_upsert_traces(
 # ---------------------------------------------------------------------------
 
 def sync_upsert_ledgers(
+    org_id: str,
     project_id: str,
     user_id: str,
     items: list[dict[str, Any]],
@@ -143,12 +202,12 @@ def sync_upsert_ledgers(
     """Upsert a batch of ledgers.  Returns count of items processed."""
     if not items:
         return 0
-    db.ensure_project(project_id)
+    db.ensure_project(org_id, project_id)
     for item in items:
         commit_sha = item.get("commit_sha")
         if not commit_sha:
             continue
-        db.upsert_ledger(project_id, user_id, commit_sha, item)
+        db.upsert_ledger(org_id, project_id, user_id, commit_sha, item)
     return len(items)
 
 
@@ -157,6 +216,7 @@ def sync_upsert_ledgers(
 # ---------------------------------------------------------------------------
 
 def sync_upsert_commit_links(
+    org_id: str,
     project_id: str,
     user_id: str,
     items: list[dict[str, Any]],
@@ -164,12 +224,13 @@ def sync_upsert_commit_links(
     """Upsert a batch of commit links.  Returns count of items processed."""
     if not items:
         return 0
-    db.ensure_project(project_id)
+    db.ensure_project(org_id, project_id)
     for item in items:
         commit_sha = item.get("commit_sha")
         if not commit_sha:
             continue
         db.insert_commit_link(
+            org_id=org_id,
             project_id=project_id,
             user_id=user_id,
             commit_sha=commit_sha,
@@ -187,13 +248,44 @@ def sync_upsert_commit_links(
 # ---------------------------------------------------------------------------
 
 def sync_upsert_conversations(
+    org_id: str,
     project_id: str,
     user_id: str,
-    items: list[dict[str, str]],
+    items: list[dict[str, Any]],
 ) -> int:
-    """Upsert a batch of conversation contents.  Returns count."""
+    """Upsert a batch of conversation pointers / inline content.
+
+    Items may include any of:
+      - ``content``        — inline UTF-8 text (small blobs)
+      - ``content_b64``    — inline base64 (binary small blobs)
+      - ``content_sha256`` — pointer to a previously-uploaded blob
+    """
     if not items:
         return 0
-    db.ensure_project(project_id)
-    db.upsert_conversation_contents(project_id, user_id, items)
+    db.ensure_project(org_id, project_id)
+    for item in items:
+        if not item.get("url") and not item.get("url_hash"):
+            continue
+        db.upsert_conversation_pointer(org_id, project_id, user_id, item)
     return len(items)
+
+
+# ---------------------------------------------------------------------------
+# Blobs (content-addressed)
+# ---------------------------------------------------------------------------
+
+def store_blob(raw: bytes) -> dict[str, Any]:
+    """Store a blob keyed by its SHA-256. Idempotent."""
+    if len(raw) > BLOB_MAX_BYTES:
+        raise ValueError(f"blob too large: {len(raw)} > {BLOB_MAX_BYTES}")
+    sha = hashlib.sha256(raw).hexdigest()
+    db.insert_blob(sha, raw)
+    return {"sha256": sha, "size": len(raw)}
+
+
+def fetch_blob(sha256: str) -> bytes | None:
+    return db.get_blob_bytes(sha256)
+
+
+def blob_present(sha256: str) -> bool:
+    return db.blob_exists(sha256)

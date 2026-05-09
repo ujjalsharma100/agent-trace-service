@@ -6,7 +6,8 @@ Reads individual .sql files from the sql/ directory and applies them in the
 correct order to create (or reset) the schema.
 
 Usage:
-    python init_db.py create   — create all tables
+    python init_db.py create   — create all tables (idempotent)
+    python init_db.py migrate  — alias for create (no legacy data to migrate)
     python init_db.py drop     — drop all tables (asks for confirmation)
     python init_db.py reset    — drop + recreate (asks for confirmation)
     python init_db.py status   — show row counts
@@ -33,11 +34,17 @@ def _build_database_url() -> str:
 
 # Order matters — tables with foreign keys come after the tables they reference.
 SQL_FILES = [
+    "orgs.sql",
+    "tokens.sql",
     "projects.sql",
+    "blobs.sql",
     "traces.sql",
     "conversation_contents.sql",
     "commit_links.sql",
 ]
+
+# Bumped whenever sql/ contents change. Surfaced via /health and /api/v1/version.
+SCHEMA_VERSION = "002-multitenancy"
 
 SQL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sql")
 
@@ -60,7 +67,7 @@ def create_tables(conn):
             cur.execute(sql)
         print(f"  Applied {filename}")
     conn.commit()
-    print("Tables created successfully.")
+    print(f"Schema version {SCHEMA_VERSION} applied.")
 
 
 def drop_tables(conn):
@@ -70,7 +77,10 @@ def drop_tables(conn):
             DROP TABLE IF EXISTS commit_links CASCADE;
             DROP TABLE IF EXISTS conversation_contents CASCADE;
             DROP TABLE IF EXISTS traces CASCADE;
+            DROP TABLE IF EXISTS blobs CASCADE;
             DROP TABLE IF EXISTS projects CASCADE;
+            DROP TABLE IF EXISTS tokens CASCADE;
+            DROP TABLE IF EXISTS orgs CASCADE;
         """)
     conn.commit()
     print("All tables dropped.")
@@ -85,7 +95,15 @@ def reset_tables(conn):
 
 def show_status(conn):
     """Print row counts for each table."""
-    tables = ["projects", "traces", "conversation_contents", "commit_links"]
+    tables = [
+        "orgs",
+        "tokens",
+        "projects",
+        "blobs",
+        "traces",
+        "conversation_contents",
+        "commit_links",
+    ]
     print("Database status:\n")
     with conn.cursor() as cur:
         for table in tables:
@@ -105,7 +123,7 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["create", "drop", "reset", "status"],
+        choices=["create", "migrate", "drop", "reset", "status"],
         help="Command to execute",
     )
     parser.add_argument(
@@ -117,7 +135,7 @@ def main():
     conn = get_connection(args.database_url)
 
     try:
-        if args.command == "create":
+        if args.command in ("create", "migrate"):
             create_tables(conn)
 
         elif args.command == "drop":

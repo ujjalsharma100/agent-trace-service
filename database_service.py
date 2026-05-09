@@ -4,8 +4,12 @@ Database access layer for agent-trace-service — pure datastore operations.
 All raw SQL lives here — no other module should import psycopg2 directly
 (except init_db.py for schema management).
 
+Every domain helper takes ``org_id`` (and ``project_id`` where relevant) as
+explicit parameters; routes derive these from the validated bearer token
+and pass them down. There is no implicit ``current_org`` global.
+
 Supports the sync protocol with ``since``/``limit``-based pagination for
-every artifact type.  NO domain logic (scoring, attribution matching).
+every artifact type. NO domain logic (scoring, attribution matching).
 """
 
 from __future__ import annotations
@@ -18,9 +22,18 @@ import psycopg2
 import psycopg2.extras
 from flask import g
 
-from model import Project, ProjectStats, TraceFields
+from model import (
+    Org,
+    Project,
+    ProjectStats,
+    TokenContext,
+    TokenSummary,
+    TraceFields,
+)
 
 psycopg2.extras.register_uuid()
+
+DEFAULT_ORG_ID = "00000000-0000-0000-0000-000000000001"
 
 
 # ---------------------------------------------------------------------------
@@ -65,27 +78,177 @@ def check_db_health() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Projects
+# Orgs
 # ---------------------------------------------------------------------------
 
-def ensure_project(project_id: str) -> None:
+def get_org_by_id(org_id: str) -> Org | None:
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, slug, name, created_at FROM orgs WHERE id = %s", (org_id,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    return Org(id=str(row["id"]), slug=row["slug"], name=row["name"], created_at=row["created_at"])
+
+
+def get_org_by_slug(slug: str) -> Org | None:
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, slug, name, created_at FROM orgs WHERE slug = %s", (slug,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    return Org(id=str(row["id"]), slug=row["slug"], name=row["name"], created_at=row["created_at"])
+
+
+def create_org(slug: str, name: str | None = None) -> Org:
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "INSERT INTO orgs (slug, name) VALUES (%s, %s) RETURNING id, slug, name, created_at",
+            (slug, name),
+        )
+        row = cur.fetchone()
+    return Org(id=str(row["id"]), slug=row["slug"], name=row["name"], created_at=row["created_at"])
+
+
+# ---------------------------------------------------------------------------
+# Tokens
+# ---------------------------------------------------------------------------
+
+def insert_token(
+    *,
+    org_id: str,
+    project_id: str | None,
+    scopes: list[str],
+    token_hash: str,
+    prefix: str,
+    name: str | None,
+) -> str:
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO tokens (org_id, project_id, scopes, token_hash, prefix, name)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (org_id, project_id, scopes, token_hash, prefix, name),
+        )
+        row = cur.fetchone()
+    return str(row["id"])
+
+
+def lookup_token_by_hash(token_hash: str) -> TokenContext | None:
+    """Return the auth context for an active (not revoked) token hash, else None.
+
+    Also bumps ``last_used_at``.
+    """
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, org_id, project_id, scopes
+            FROM tokens
+            WHERE token_hash = %s AND revoked_at IS NULL
+            """,
+            (token_hash,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cur.execute(
+            "UPDATE tokens SET last_used_at = NOW() WHERE id = %s",
+            (row["id"],),
+        )
+    return TokenContext(
+        token_id=str(row["id"]),
+        org_id=str(row["org_id"]),
+        project_id_scope=row["project_id"],
+        scopes=list(row["scopes"] or []),
+    )
+
+
+def revoke_token(token_id: str) -> bool:
     db = get_db()
     with db.cursor() as cur:
         cur.execute(
-            "INSERT INTO projects (project_id) VALUES (%s) ON CONFLICT (project_id) DO NOTHING",
-            (project_id,),
+            "UPDATE tokens SET revoked_at = NOW() WHERE id = %s AND revoked_at IS NULL",
+            (token_id,),
+        )
+        return cur.rowcount > 0
+
+
+def list_tokens(org_id: str | None = None) -> list[TokenSummary]:
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if org_id:
+            cur.execute(
+                """
+                SELECT id, org_id, project_id, scopes, prefix, name,
+                       created_at, last_used_at, revoked_at
+                FROM tokens
+                WHERE org_id = %s
+                ORDER BY created_at DESC
+                """,
+                (org_id,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, org_id, project_id, scopes, prefix, name,
+                       created_at, last_used_at, revoked_at
+                FROM tokens
+                ORDER BY created_at DESC
+                """,
+            )
+        rows = cur.fetchall()
+    return [
+        TokenSummary(
+            id=str(r["id"]),
+            org_id=str(r["org_id"]),
+            project_id=r["project_id"],
+            scopes=list(r["scopes"] or []),
+            prefix=r["prefix"],
+            name=r["name"],
+            created_at=r["created_at"],
+            last_used_at=r["last_used_at"],
+            revoked_at=r["revoked_at"],
+        )
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Projects
+# ---------------------------------------------------------------------------
+
+def ensure_project(org_id: str, project_id: str) -> None:
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO projects (org_id, project_id)
+            VALUES (%s, %s)
+            ON CONFLICT (org_id, project_id) DO NOTHING
+            """,
+            (org_id, project_id),
         )
 
 
-def get_project(project_id: str) -> Project | None:
+def get_project(org_id: str, project_id: str) -> Project | None:
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT * FROM projects WHERE project_id = %s", (project_id,))
+        cur.execute(
+            "SELECT * FROM projects WHERE org_id = %s AND project_id = %s",
+            (org_id, project_id),
+        )
         row = cur.fetchone()
     if not row:
         return None
     return Project(
         id=str(row["id"]),
+        org_id=str(row["org_id"]),
         project_id=row["project_id"],
         name=row.get("name"),
         description=row.get("description"),
@@ -94,22 +257,41 @@ def get_project(project_id: str) -> Project | None:
     )
 
 
-def get_project_stats(project_id: str) -> ProjectStats:
+def get_project_stats(org_id: str, project_id: str) -> ProjectStats:
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT COUNT(*) AS count FROM traces WHERE project_id = %s", (project_id,))
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM traces WHERE org_id = %s AND project_id = %s",
+            (org_id, project_id),
+        )
         trace_count = cur.fetchone()["count"]
 
         cur.execute(
-            "SELECT trace_timestamp FROM traces WHERE project_id = %s ORDER BY trace_timestamp DESC LIMIT 1",
-            (project_id,),
+            """
+            SELECT trace_timestamp FROM traces
+            WHERE org_id = %s AND project_id = %s
+            ORDER BY trace_timestamp DESC LIMIT 1
+            """,
+            (org_id, project_id),
         )
         latest = cur.fetchone()
 
-        cur.execute("SELECT COUNT(DISTINCT user_id) AS count FROM traces WHERE project_id = %s", (project_id,))
+        cur.execute(
+            """
+            SELECT COUNT(DISTINCT user_id) AS count FROM traces
+            WHERE org_id = %s AND project_id = %s
+            """,
+            (org_id, project_id),
+        )
         unique_users = cur.fetchone()["count"]
 
-        cur.execute("SELECT COUNT(*) AS count FROM conversation_contents WHERE project_id = %s", (project_id,))
+        cur.execute(
+            """
+            SELECT COUNT(*) AS count FROM conversation_contents
+            WHERE org_id = %s AND project_id = %s
+            """,
+            (org_id, project_id),
+        )
         conv_count = cur.fetchone()["count"]
 
     return ProjectStats(
@@ -124,25 +306,30 @@ def get_project_stats(project_id: str) -> ProjectStats:
 # Traces — CRUD + sync pagination
 # ---------------------------------------------------------------------------
 
-def insert_trace(project_id: str, user_id: str, fields: TraceFields) -> None:
+def insert_trace(
+    org_id: str,
+    project_id: str,
+    user_id: str,
+    fields: TraceFields,
+) -> None:
     db = get_db()
     with db.cursor() as cur:
         cur.execute(
             """
             INSERT INTO traces (
-                project_id, user_id,
+                org_id, project_id, user_id,
                 trace_id, version, trace_timestamp,
                 vcs, tool, files, metadata,
                 trace_record
             ) VALUES (
-                %s, %s,
+                %s, %s, %s,
                 %s, %s, %s,
                 %s, %s, %s, %s,
                 %s
-            ) ON CONFLICT (project_id, trace_id) DO NOTHING
+            ) ON CONFLICT (org_id, project_id, trace_id) DO NOTHING
             """,
             (
-                project_id, user_id,
+                org_id, project_id, user_id,
                 fields.trace_id, fields.version, fields.trace_timestamp,
                 fields.vcs, fields.tool, fields.files, fields.metadata,
                 fields.trace_record,
@@ -151,30 +338,28 @@ def insert_trace(project_id: str, user_id: str, fields: TraceFields) -> None:
 
 
 def list_traces_since(
+    org_id: str,
     project_id: str,
     *,
     since: str = "",
     limit: int = 500,
 ) -> tuple[list[Any], str | None]:
-    """Return traces newer than ``since``, ordered by timestamp.
-
-    Returns ``(items, max_timestamp)`` for cursor advancement.
-    """
+    """Return traces newer than ``since`` for ``(org_id, project_id)``."""
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         if since:
             cur.execute(
                 """SELECT trace_record FROM traces
-                   WHERE project_id = %s AND trace_timestamp > %s
+                   WHERE org_id = %s AND project_id = %s AND trace_timestamp > %s
                    ORDER BY trace_timestamp ASC LIMIT %s""",
-                (project_id, since, limit),
+                (org_id, project_id, since, limit),
             )
         else:
             cur.execute(
                 """SELECT trace_record FROM traces
-                   WHERE project_id = %s
+                   WHERE org_id = %s AND project_id = %s
                    ORDER BY trace_timestamp ASC LIMIT %s""",
-                (project_id, limit),
+                (org_id, project_id, limit),
             )
         rows = cur.fetchall()
 
@@ -192,12 +377,13 @@ def list_traces_since(
     return items, max_ts
 
 
-def get_trace(project_id: str, trace_id: str) -> dict[str, Any] | None:
+def get_trace(org_id: str, project_id: str, trace_id: str) -> dict[str, Any] | None:
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT trace_record, user_id FROM traces WHERE project_id = %s AND trace_id = %s LIMIT 1",
-            (project_id, trace_id),
+            """SELECT trace_record, user_id FROM traces
+               WHERE org_id = %s AND project_id = %s AND trace_id = %s LIMIT 1""",
+            (org_id, project_id, trace_id),
         )
         row = cur.fetchone()
     if not row:
@@ -210,6 +396,7 @@ def get_trace(project_id: str, trace_id: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 def upsert_ledger(
+    org_id: str,
     project_id: str,
     user_id: str,
     commit_sha: str,
@@ -221,14 +408,15 @@ def upsert_ledger(
         cur.execute(
             """
             INSERT INTO commit_links (
-                project_id, user_id, commit_sha, parent_sha,
+                org_id, project_id, user_id, commit_sha, parent_sha,
                 trace_ids, files_changed, committed_at, ledger
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (project_id, commit_sha) DO UPDATE SET
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (org_id, project_id, commit_sha) DO UPDATE SET
                 ledger = EXCLUDED.ledger,
                 user_id = EXCLUDED.user_id
             """,
             (
+                org_id,
                 project_id,
                 user_id,
                 commit_sha,
@@ -242,6 +430,7 @@ def upsert_ledger(
 
 
 def list_ledgers_since(
+    org_id: str,
     project_id: str,
     *,
     since: str = "",
@@ -253,17 +442,17 @@ def list_ledgers_since(
         if since:
             cur.execute(
                 """SELECT ledger FROM commit_links
-                   WHERE project_id = %s AND ledger IS NOT NULL
+                   WHERE org_id = %s AND project_id = %s AND ledger IS NOT NULL
                      AND created_at > %s
                    ORDER BY created_at ASC LIMIT %s""",
-                (project_id, since, limit),
+                (org_id, project_id, since, limit),
             )
         else:
             cur.execute(
                 """SELECT ledger FROM commit_links
-                   WHERE project_id = %s AND ledger IS NOT NULL
+                   WHERE org_id = %s AND project_id = %s AND ledger IS NOT NULL
                    ORDER BY created_at ASC LIMIT %s""",
-                (project_id, limit),
+                (org_id, project_id, limit),
             )
         rows = cur.fetchall()
 
@@ -276,14 +465,15 @@ def list_ledgers_since(
     return items, max_ts
 
 
-def get_ledger(project_id: str, commit_sha: str) -> dict[str, Any] | None:
+def get_ledger(org_id: str, project_id: str, commit_sha: str) -> dict[str, Any] | None:
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """SELECT ledger FROM commit_links
-               WHERE project_id = %s AND commit_sha = %s AND ledger IS NOT NULL
+               WHERE org_id = %s AND project_id = %s AND commit_sha = %s
+                 AND ledger IS NOT NULL
                LIMIT 1""",
-            (project_id, commit_sha),
+            (org_id, project_id, commit_sha),
         )
         row = cur.fetchone()
     if not row:
@@ -296,6 +486,7 @@ def get_ledger(project_id: str, commit_sha: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 def insert_commit_link(
+    org_id: str,
     project_id: str,
     user_id: str,
     commit_sha: str,
@@ -310,18 +501,19 @@ def insert_commit_link(
         cur.execute(
             """
             INSERT INTO commit_links (
-                project_id, user_id, commit_sha, parent_sha,
+                org_id, project_id, user_id, commit_sha, parent_sha,
                 trace_ids, files_changed, committed_at, ledger
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (project_id, commit_sha) DO UPDATE SET
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (org_id, project_id, commit_sha) DO UPDATE SET
                 parent_sha    = EXCLUDED.parent_sha,
                 trace_ids     = EXCLUDED.trace_ids,
                 files_changed = EXCLUDED.files_changed,
                 committed_at  = EXCLUDED.committed_at,
-                ledger        = EXCLUDED.ledger,
+                ledger        = COALESCE(EXCLUDED.ledger, commit_links.ledger),
                 user_id       = EXCLUDED.user_id
             """,
             (
+                org_id,
                 project_id,
                 user_id,
                 commit_sha,
@@ -335,6 +527,7 @@ def insert_commit_link(
 
 
 def list_commit_links_since(
+    org_id: str,
     project_id: str,
     *,
     since: str = "",
@@ -348,18 +541,18 @@ def list_commit_links_since(
                 """SELECT id, project_id, user_id, commit_sha, parent_sha,
                           trace_ids, files_changed, committed_at, created_at
                    FROM commit_links
-                   WHERE project_id = %s AND created_at > %s
+                   WHERE org_id = %s AND project_id = %s AND created_at > %s
                    ORDER BY created_at ASC LIMIT %s""",
-                (project_id, since, limit),
+                (org_id, project_id, since, limit),
             )
         else:
             cur.execute(
                 """SELECT id, project_id, user_id, commit_sha, parent_sha,
                           trace_ids, files_changed, committed_at, created_at
                    FROM commit_links
-                   WHERE project_id = %s
+                   WHERE org_id = %s AND project_id = %s
                    ORDER BY created_at ASC LIMIT %s""",
-                (project_id, limit),
+                (org_id, project_id, limit),
             )
         rows = cur.fetchall()
 
@@ -381,76 +574,155 @@ def list_commit_links_since(
 
 
 # ---------------------------------------------------------------------------
+# Blobs — content-addressed storage
+# ---------------------------------------------------------------------------
+
+def blob_exists(sha256: str) -> bool:
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute("SELECT 1 FROM blobs WHERE sha256 = %s", (sha256,))
+        return cur.fetchone() is not None
+
+
+def insert_blob(sha256: str, raw: bytes, content_type: str | None = None) -> None:
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO blobs (sha256, size, content_type, bytes)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (sha256) DO NOTHING
+            """,
+            (sha256, len(raw), content_type, psycopg2.Binary(raw)),
+        )
+
+
+def get_blob_bytes(sha256: str) -> bytes | None:
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT bytes FROM blobs WHERE sha256 = %s", (sha256,))
+        row = cur.fetchone()
+    if not row or row["bytes"] is None:
+        return None
+    return bytes(row["bytes"])
+
+
+# ---------------------------------------------------------------------------
 # Conversations — CRUD + sync pagination
 # ---------------------------------------------------------------------------
 
-def upsert_conversation_contents(
+def upsert_conversation_pointer(
+    org_id: str,
     project_id: str,
     user_id: str,
-    contents: list[dict[str, str]],
+    item: dict[str, Any],
 ) -> None:
-    if not contents:
+    """Insert or update a conversation pointer.
+
+    Accepts both inline (``content`` / ``content_b64``) and chunked
+    (``content_sha256`` + ``size``) payloads. Upstream callers may set both
+    inline content AND a sha pointer when the blob is small enough to be
+    inlined for round-trip simplicity; the schema permits it.
+    """
+    url = item.get("url") or item.get("url_hash")
+    if not url:
         return
     db = get_db()
     with db.cursor() as cur:
-        for item in contents:
-            cur.execute(
-                """
-                INSERT INTO conversation_contents (project_id, user_id, url, content)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (project_id, url) DO UPDATE SET
-                    content    = EXCLUDED.content,
-                    updated_at = NOW()
-                """,
-                (project_id, user_id, item.get("url", ""), item.get("content", "")),
+        cur.execute(
+            """
+            INSERT INTO conversation_contents (
+                org_id, project_id, user_id, url,
+                content, content_b64, content_sha256, size
             )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (org_id, project_id, url) DO UPDATE SET
+                content        = EXCLUDED.content,
+                content_b64    = EXCLUDED.content_b64,
+                content_sha256 = EXCLUDED.content_sha256,
+                size           = EXCLUDED.size,
+                updated_at     = NOW()
+            """,
+            (
+                org_id,
+                project_id,
+                user_id,
+                url,
+                item.get("content"),
+                item.get("content_b64"),
+                item.get("content_sha256"),
+                item.get("size"),
+            ),
+        )
 
 
 def list_conversations_since(
+    org_id: str,
     project_id: str,
     *,
     since: str = "",
     limit: int = 500,
 ) -> tuple[list[Any], str | None]:
-    """Return conversation contents newer than ``since``."""
+    """Return conversation pointers newer than ``since``."""
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         if since:
             cur.execute(
-                """SELECT url, content, updated_at FROM conversation_contents
-                   WHERE project_id = %s AND updated_at > %s
+                """SELECT url, content, content_b64, content_sha256, size, updated_at
+                   FROM conversation_contents
+                   WHERE org_id = %s AND project_id = %s AND updated_at > %s
                    ORDER BY updated_at ASC LIMIT %s""",
-                (project_id, since, limit),
+                (org_id, project_id, since, limit),
             )
         else:
             cur.execute(
-                """SELECT url, content, updated_at FROM conversation_contents
-                   WHERE project_id = %s
+                """SELECT url, content, content_b64, content_sha256, size, updated_at
+                   FROM conversation_contents
+                   WHERE org_id = %s AND project_id = %s
                    ORDER BY updated_at ASC LIMIT %s""",
-                (project_id, limit),
+                (org_id, project_id, limit),
             )
         rows = cur.fetchall()
 
-    items = []
+    items: list[dict[str, Any]] = []
     max_ts = None
     for row in rows:
-        item = {
-            "url": row["url"],
-            "content": row["content"],
-        }
-        items.append(item)
+        item: dict[str, Any] = {"url": row["url"], "url_hash": row["url"]}
+        if row["content"] is not None:
+            item["content"] = row["content"]
+        if row["content_b64"] is not None:
+            item["content_b64"] = row["content_b64"]
+        if row["content_sha256"]:
+            item["content_sha256"] = row["content_sha256"]
+        if row["size"] is not None:
+            item["size"] = row["size"]
         if row["updated_at"]:
+            item["updated_at"] = row["updated_at"].isoformat()
             max_ts = row["updated_at"].isoformat()
-
+        items.append(item)
     return items, max_ts
 
 
-def get_conversation_content(project_id: str, url: str) -> str | None:
+def get_conversation_pointer(
+    org_id: str,
+    project_id: str,
+    url: str,
+) -> dict[str, Any] | None:
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT content FROM conversation_contents WHERE project_id = %s AND url = %s LIMIT 1",
-            (project_id, url),
+            """SELECT url, content, content_b64, content_sha256, size
+               FROM conversation_contents
+               WHERE org_id = %s AND project_id = %s AND url = %s LIMIT 1""",
+            (org_id, project_id, url),
         )
         row = cur.fetchone()
-    return row["content"] if row else None
+    if not row:
+        return None
+    return {
+        "url": row["url"],
+        "content": row["content"],
+        "content_b64": row["content_b64"],
+        "content_sha256": row["content_sha256"],
+        "size": row["size"],
+    }

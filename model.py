@@ -7,9 +7,71 @@ No domain logic (attribution, scoring, etc.).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Org
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Org:
+    id: str
+    slug: str
+    name: str | None = None
+    created_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "slug": self.slug,
+            "name": self.name,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Token
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TokenContext:
+    """Resolved auth context for a presented bearer token."""
+
+    token_id: str
+    org_id: str
+    project_id_scope: str | None
+    scopes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TokenSummary:
+    """Public-facing token metadata (the plaintext token is never returned)."""
+
+    id: str
+    org_id: str
+    project_id: str | None
+    scopes: list[str]
+    prefix: str
+    name: str | None
+    created_at: datetime | None
+    last_used_at: datetime | None
+    revoked_at: datetime | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "org_id": self.org_id,
+            "project_id": self.project_id,
+            "scopes": self.scopes,
+            "prefix": self.prefix,
+            "name": self.name,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None,
+            "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -19,6 +81,7 @@ from typing import Any
 @dataclass
 class Project:
     project_id: str
+    org_id: str
     id: str | None = None
     name: str | None = None
     description: str | None = None
@@ -28,6 +91,7 @@ class Project:
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": str(self.id) if self.id else None,
+            "org_id": self.org_id,
             "project_id": self.project_id,
             "name": self.name,
             "description": self.description,

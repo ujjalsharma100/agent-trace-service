@@ -67,7 +67,7 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Set DB_* variables, AUTH_SECRET, etc.
+# Set DB_* variables, ADMIN_SECRET, etc.
 ```
 
 ### 4. Create the database
@@ -101,34 +101,58 @@ Default URL: `http://localhost:5000`.
 | `DB_PASSWORD` | `postgres` | PostgreSQL password |
 | `DB_NAME` | `agent_trace` | Database name |
 | `PORT` | `5000` | HTTP port |
-| `AUTH_SECRET` | `dev-secret` | HMAC secret for bearer tokens (change in production) |
+| `ADMIN_SECRET` | `dev-admin-secret` | Required by `X-Admin-Secret` for token + org admin endpoints. Change in production. |
+| `BLOB_MAX_BYTES` | `10485760` | Max body size accepted by `POST /api/v1/blobs`. |
+| `BUILD_SHA` | `dev` | Surfaced via `/health` and `/api/v1/version`. Set in CI / Docker build. |
 | `FLASK_DEBUG` | `0` | Set `1` for debug / auto-reload |
 
 ---
 
 ## API overview
 
-All routes except **`GET /`** and **`GET /health`** require:
+Most routes require:
 
 ```http
 Authorization: Bearer <token>
 ```
 
-Obtain a token with **`POST /api/v1/tokens/generate`** (`{"user_id": "..."}`).
+A token is opaque (`at_<32 url-safe chars>`) and is scoped to a single
+`(org_id, project_id?)` tuple. Tokens are minted by the admin endpoint —
+the admin must provide the `X-Admin-Secret` header matching `ADMIN_SECRET`.
+Self-hosted single-tenant deployments are pre-seeded with the well-known
+**default org** (`00000000-0000-0000-0000-000000000001`); if you don't
+specify `org_id` when issuing a token, that's where it lands.
+
+```bash
+curl -X POST http://localhost:5000/api/v1/tokens \
+  -H "X-Admin-Secret: $ADMIN_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-laptop"}'
+# => {"id": "...", "token": "at_xxxx...", "prefix": "at_xxxx", ...}
+```
 
 ### Discovery & health
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/` | No | Service name, version, endpoint map |
-| `GET` | `/health` | No | Health + DB connectivity |
+| `GET` | `/health` | No | Health + DB connectivity + `schema_version` + `build` |
+| `GET` | `/api/v1/version` | No | `{schema_version, build, name}` for client compat checks |
 
 ### Tokens
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `POST` | `/api/v1/tokens/generate` | No | Issue bearer token |
-| `POST` | `/api/v1/tokens/verify` | No | Verify token |
+| `POST` | `/api/v1/tokens` | `X-Admin-Secret` | Issue token (returns plaintext exactly once) |
+| `GET` | `/api/v1/tokens` | `X-Admin-Secret` | List tokens (metadata only — no plaintext) |
+| `DELETE` | `/api/v1/tokens/<id>` | `X-Admin-Secret` | Revoke a token |
+| `POST` | `/api/v1/tokens/verify` | No | Verify a presented token, return scope |
+
+### Orgs
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/api/v1/orgs` | `X-Admin-Secret` | Create or fetch an org by slug |
 
 ### Sync (primary path for CLI `push` / `pull`)
 
@@ -149,16 +173,32 @@ Bulk upsert (**POST**, JSON body with `project_id` and `items`) and incremental 
 |--------|------|-------------|
 | `GET` | `/api/v1/traces/<trace_id>?project_id=` | Single trace JSON |
 | `GET` | `/api/v1/ledgers/<commit_sha>?project_id=` | Ledger JSON for a commit (404 if missing) |
-| `GET` | `/api/v1/conversations/<url_hash>?project_id=` | Conversation body |
+| `GET` | `/api/v1/conversations/<url_hash>?project_id=` | Conversation pointer + inline content (or sha + size) |
 
 Query-parameter names match `app.py` (see source for exact spelling).
+
+### Conversation blobs (chunked upload)
+
+Large transcripts go through a content-addressed blob path so the same
+content is uploaded once even when many traces reference it.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `HEAD` | `/api/v1/blobs/<sha256>` | `200` if present, `404` otherwise |
+| `POST` | `/api/v1/blobs` | Raw body upload (max `BLOB_MAX_BYTES`); returns `{sha256, size}` |
+| `GET` | `/api/v1/blobs/<sha256>` | Raw bytes (`application/octet-stream`) |
+
+The CLI (`agent-trace push`) prefers the blob path for any transcript above
+its inline threshold (256 KiB). Inline content via the conversations sync
+endpoint is still accepted for small blobs.
 
 ---
 
 ## Database management
 
 ```bash
-python init_db.py create    # Create tables
+python init_db.py create    # Create tables (idempotent)
+python init_db.py migrate   # Alias for create (no legacy data to migrate)
 python init_db.py status    # Row counts
 python init_db.py drop      # Drop all (confirmation)
 python init_db.py reset     # Drop + recreate (confirmation)
@@ -166,7 +206,17 @@ python init_db.py reset     # Drop + recreate (confirmation)
 python init_db.py create --database-url postgresql://user:pass@host:5432/dbname
 ```
 
-Schema files live under `sql/`. For table-level detail, inspect `sql/*.sql` in this directory.
+Schema files live under `sql/`. For table-level detail, inspect `sql/*.sql` in this directory. Application order:
+
+1. `orgs.sql`
+2. `tokens.sql`
+3. `projects.sql`
+4. `blobs.sql`
+5. `traces.sql`
+6. `conversation_contents.sql`
+7. `commit_links.sql`
+
+The schema version (currently `002-multitenancy`) is exposed by `/health` and `/api/v1/version` — bump `init_db.SCHEMA_VERSION` and `agent_trace_service.SCHEMA_VERSION` together when sql/ changes.
 
 ---
 

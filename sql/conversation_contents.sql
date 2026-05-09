@@ -1,22 +1,41 @@
 -- =========================================================================
 -- Conversation contents table
 --
--- Stores the actual content for conversation URLs found in trace records.
--- The URL itself is the unique identifier — trace records reference URLs,
--- and this table provides the content lookup.
+-- Stores transcript pointers / inline content for conversation URLs found
+-- in trace records. Two storage modes coexist:
+--
+--   * Inline ``content`` (or ``content_b64`` for binary) for blobs below
+--     the chunk threshold. Kept here for round-trip simplicity.
+--   * Pointer to ``blobs.sha256`` for chunked uploads. The CLI HEAD/POSTs
+--     to ``/api/v1/blobs`` first; this row only carries the hash.
+--
+-- Scoped by (org_id, project_id, url).
 -- =========================================================================
 
 CREATE TABLE IF NOT EXISTS conversation_contents (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    project_id      TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    org_id          UUID NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+    project_id      TEXT NOT NULL,
     user_id         TEXT NOT NULL,
-    url             TEXT NOT NULL,
-    content         TEXT NOT NULL,
+
+    url             TEXT NOT NULL,                     -- url_hash from CLI
+
+    -- Inline storage (small blobs, < CHUNK_THRESHOLD)
+    content         TEXT,
+    content_b64     TEXT,
+
+    -- Chunked storage (pointer to blobs table)
+    content_sha256  TEXT REFERENCES blobs(sha256) ON DELETE SET NULL,
+    size            BIGINT,
+
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    UNIQUE (project_id, url)
+    UNIQUE (org_id, project_id, url),
+    FOREIGN KEY (org_id, project_id) REFERENCES projects (org_id, project_id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS conv_contents_project_id_idx ON conversation_contents (project_id);
-CREATE INDEX IF NOT EXISTS conv_contents_url_idx        ON conversation_contents (url);
+CREATE INDEX IF NOT EXISTS conv_contents_org_project_idx
+    ON conversation_contents (org_id, project_id);
+CREATE INDEX IF NOT EXISTS conv_contents_sha_idx
+    ON conversation_contents (content_sha256);
