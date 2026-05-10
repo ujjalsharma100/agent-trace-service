@@ -468,36 +468,33 @@ def list_traces_since(
     since: str = "",
     limit: int = 500,
 ) -> tuple[list[Any], str | None]:
-    """Return traces newer than ``since`` for ``(org_id, project_id)``."""
+    """Return traces ingested after ``since`` for ``(org_id, project_id)``.
+
+    ``since`` is compared against ``created_at`` (server ingestion time), not
+    ``trace_timestamp`` (originator's clock). This keeps the cursor monotonic
+    in server time so a teammate's older-stamped trace pushed today is still
+    visible to a peer whose pull cursor advanced past yesterday.
+    """
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         if since:
             cur.execute(
-                """SELECT trace_record FROM traces
-                   WHERE org_id = %s AND project_id = %s AND trace_timestamp > %s
-                   ORDER BY trace_timestamp ASC LIMIT %s""",
+                """SELECT trace_record, created_at FROM traces
+                   WHERE org_id = %s AND project_id = %s AND created_at > %s
+                   ORDER BY created_at ASC LIMIT %s""",
                 (org_id, project_id, since, limit),
             )
         else:
             cur.execute(
-                """SELECT trace_record FROM traces
+                """SELECT trace_record, created_at FROM traces
                    WHERE org_id = %s AND project_id = %s
-                   ORDER BY trace_timestamp ASC LIMIT %s""",
+                   ORDER BY created_at ASC LIMIT %s""",
                 (org_id, project_id, limit),
             )
         rows = cur.fetchall()
 
     items = [r["trace_record"] for r in rows]
-    max_ts = None
-    if items:
-        last = items[-1]
-        if isinstance(last, dict):
-            max_ts = last.get("timestamp")
-        elif isinstance(last, str):
-            try:
-                max_ts = json.loads(last).get("timestamp")
-            except (json.JSONDecodeError, AttributeError):
-                pass
+    max_ts = rows[-1]["created_at"].isoformat() if rows else None
     return items, max_ts
 
 

@@ -32,7 +32,7 @@ ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "dev-admin-secret")
 
 # Bumped whenever sql/ contents change. Source of truth for /health and
 # /api/v1/version. Kept in sync with init_db.SCHEMA_VERSION.
-SCHEMA_VERSION = "003-project-slugs"
+SCHEMA_VERSION = "004-traces-created-at-idx"
 
 # Build SHA — populated by deploy / Dockerfile via env. Falls back to "dev".
 BUILD_SHA = os.environ.get("BUILD_SHA", "dev")

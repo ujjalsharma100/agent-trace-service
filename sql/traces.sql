@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS traces (
 CREATE INDEX IF NOT EXISTS traces_org_project_idx       ON traces (org_id, project_id);
 CREATE INDEX IF NOT EXISTS traces_user_id_idx           ON traces (user_id);
 CREATE INDEX IF NOT EXISTS traces_trace_timestamp_idx   ON traces (org_id, project_id, trace_timestamp);
+CREATE INDEX IF NOT EXISTS traces_created_at_idx        ON traces (org_id, project_id, created_at);
 CREATE INDEX IF NOT EXISTS traces_tool_idx              ON traces USING GIN (tool);
 CREATE INDEX IF NOT EXISTS traces_metadata_idx          ON traces USING GIN (metadata);
 
