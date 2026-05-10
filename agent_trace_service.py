@@ -32,7 +32,7 @@ ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "dev-admin-secret")
 
 # Bumped whenever sql/ contents change. Source of truth for /health and
 # /api/v1/version. Kept in sync with init_db.SCHEMA_VERSION.
-SCHEMA_VERSION = "002-multitenancy"
+SCHEMA_VERSION = "003-project-slugs"
 
 # Build SHA — populated by deploy / Dockerfile via env. Falls back to "dev".
 BUILD_SHA = os.environ.get("BUILD_SHA", "dev")
@@ -148,6 +148,18 @@ def assert_project_in_token_scope(ctx: TokenContext, project_id: str) -> bool:
     return ctx.project_id_scope == project_id
 
 
+def can_create_project(ctx: TokenContext) -> bool:
+    """Project registration requires an org-scoped token (not project-scoped)
+    that carries the ``projects:write`` scope. Project-scoped tokens are
+    intentionally barred — they can only act within an already-existing
+    project. The admin-secret path (``X-Admin-Secret``) is handled at the
+    route layer and bypasses this check.
+    """
+    if ctx.project_id_scope is not None:
+        return False
+    return "projects:write" in ctx.scopes
+
+
 # ---------------------------------------------------------------------------
 # Sync — Traces
 # ---------------------------------------------------------------------------
@@ -180,7 +192,7 @@ def sync_upsert_traces(
     """Upsert a batch of traces.  Returns count of items processed."""
     if not items:
         return 0
-    db.ensure_project(org_id, project_id)
+    db.assert_project_exists(org_id, project_id)
     for item in items:
         if not item.get("id") or not item.get("timestamp"):
             continue
@@ -202,7 +214,7 @@ def sync_upsert_ledgers(
     """Upsert a batch of ledgers.  Returns count of items processed."""
     if not items:
         return 0
-    db.ensure_project(org_id, project_id)
+    db.assert_project_exists(org_id, project_id)
     for item in items:
         commit_sha = item.get("commit_sha")
         if not commit_sha:
@@ -224,7 +236,7 @@ def sync_upsert_commit_links(
     """Upsert a batch of commit links.  Returns count of items processed."""
     if not items:
         return 0
-    db.ensure_project(org_id, project_id)
+    db.assert_project_exists(org_id, project_id)
     for item in items:
         commit_sha = item.get("commit_sha")
         if not commit_sha:
@@ -262,7 +274,7 @@ def sync_upsert_conversations(
     """
     if not items:
         return 0
-    db.ensure_project(org_id, project_id)
+    db.assert_project_exists(org_id, project_id)
     for item in items:
         if not item.get("url") and not item.get("url_hash"):
             continue

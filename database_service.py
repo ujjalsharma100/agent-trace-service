@@ -14,6 +14,8 @@ every artifact type. NO domain logic (scoring, attribution matching).
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 from typing import Any
@@ -34,6 +36,42 @@ from model import (
 psycopg2.extras.register_uuid()
 
 DEFAULT_ORG_ID = "00000000-0000-0000-0000-000000000001"
+
+
+class MissingBlobForConversationError(Exception):
+    """``content_sha256`` references a row missing from ``blobs`` (chunked sync)."""
+
+    def __init__(self, sha256: str) -> None:
+        self.sha256 = sha256
+        super().__init__(sha256)
+
+
+class ProjectExistsError(Exception):
+    """``create_project`` raised because (org_id, project_id) already exists."""
+
+    def __init__(self, org_id: str, project_id: str) -> None:
+        self.org_id = org_id
+        self.project_id = project_id
+        super().__init__(f"Project {project_id!r} already exists in org {org_id}")
+
+
+class ProjectNotFoundError(Exception):
+    """Sync attempted against an unregistered (org_id, project_id)."""
+
+    def __init__(self, org_id: str, project_id: str) -> None:
+        self.org_id = org_id
+        self.project_id = project_id
+        super().__init__(f"Project {project_id!r} is not registered in org {org_id}")
+
+
+class InvalidProjectSlugError(ValueError):
+    """``project_id`` failed the slug shape CHECK constraint."""
+
+    def __init__(self, project_id: str) -> None:
+        self.project_id = project_id
+        super().__init__(
+            f"Invalid project slug {project_id!r}: must match ^[a-z0-9][a-z0-9._-]{{0,63}}$"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +262,10 @@ def list_tokens(org_id: str | None = None) -> list[TokenSummary]:
 # ---------------------------------------------------------------------------
 
 def ensure_project(org_id: str, project_id: str) -> None:
+    """Idempotent upsert. Retained for tests that need a project to appear
+    without going through the registration route. Sync paths use
+    ``assert_project_exists`` instead — projects must be explicitly created.
+    """
     db = get_db()
     with db.cursor() as cur:
         cur.execute(
@@ -234,6 +276,88 @@ def ensure_project(org_id: str, project_id: str) -> None:
             """,
             (org_id, project_id),
         )
+
+
+def assert_project_exists(org_id: str, project_id: str) -> None:
+    """Raise ``ProjectNotFoundError`` if (org_id, project_id) is not registered."""
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM projects WHERE org_id = %s AND project_id = %s",
+            (org_id, project_id),
+        )
+        if cur.fetchone() is None:
+            raise ProjectNotFoundError(org_id, project_id)
+
+
+def create_project(
+    org_id: str,
+    project_id: str,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+) -> Project:
+    """Explicit project creation. Raises ``ProjectExistsError`` on conflict.
+
+    Distinct from ``ensure_project`` (idempotent upsert called from sync paths) —
+    this is the user-facing ``POST /api/v1/projects`` registration. The slug
+    CHECK is enforced in SQL; we surface a typed error so the route can return
+    a 400.
+    """
+    db = get_db()
+    try:
+        with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO projects (org_id, project_id, name, description)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, org_id, project_id, name, description, created_at, updated_at
+                """,
+                (org_id, project_id, name, description),
+            )
+            row = cur.fetchone()
+    except psycopg2.errors.UniqueViolation:
+        db.rollback()
+        raise ProjectExistsError(org_id, project_id) from None
+    except psycopg2.errors.CheckViolation:
+        db.rollback()
+        raise InvalidProjectSlugError(project_id) from None
+    return Project(
+        id=str(row["id"]),
+        org_id=str(row["org_id"]),
+        project_id=row["project_id"],
+        name=row.get("name"),
+        description=row.get("description"),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+    )
+
+
+def list_projects(org_id: str) -> list[Project]:
+    """All projects in an org, newest first."""
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, org_id, project_id, name, description, created_at, updated_at
+            FROM projects WHERE org_id = %s
+            ORDER BY created_at DESC
+            """,
+            (org_id,),
+        )
+        rows = cur.fetchall()
+    return [
+        Project(
+            id=str(r["id"]),
+            org_id=str(r["org_id"]),
+            project_id=r["project_id"],
+            name=r.get("name"),
+            description=r.get("description"),
+            created_at=r.get("created_at"),
+            updated_at=r.get("updated_at"),
+        )
+        for r in rows
+    ]
 
 
 def get_project(org_id: str, project_id: str) -> Project | None:
@@ -611,6 +735,21 @@ def get_blob_bytes(sha256: str) -> bytes | None:
 # Conversations — CRUD + sync pagination
 # ---------------------------------------------------------------------------
 
+def _inline_payload_bytes(item: dict[str, Any]) -> bytes | None:
+    """Decode inline conversation body to raw bytes, if present."""
+    text = item.get("content")
+    if text is not None:
+        if not isinstance(text, str):
+            return None
+        return text.encode("utf-8")
+    b64 = item.get("content_b64")
+    if b64:
+        if not isinstance(b64, str):
+            return None
+        return base64.b64decode(b64)
+    return None
+
+
 def upsert_conversation_pointer(
     org_id: str,
     project_id: str,
@@ -623,10 +762,25 @@ def upsert_conversation_pointer(
     (``content_sha256`` + ``size``) payloads. Upstream callers may set both
     inline content AND a sha pointer when the blob is small enough to be
     inlined for round-trip simplicity; the schema permits it.
+
+    Inline payloads must satisfy ``conversation_contents.content_sha256`` →
+    ``blobs(sha256)``: when inline bytes are present we insert (or dedupe) the
+    blob before upserting the row so the foreign key holds.
     """
     url = item.get("url") or item.get("url_hash")
     if not url:
         return
+
+    raw = _inline_payload_bytes(item)
+    sha_for_row: str | None
+    if raw is not None:
+        sha_for_row = hashlib.sha256(raw).hexdigest()
+        insert_blob(sha_for_row, raw)
+    else:
+        sha_for_row = item.get("content_sha256")
+        if sha_for_row and not blob_exists(sha_for_row):
+            raise MissingBlobForConversationError(sha_for_row)
+
     db = get_db()
     with db.cursor() as cur:
         cur.execute(
@@ -650,7 +804,7 @@ def upsert_conversation_pointer(
                 url,
                 item.get("content"),
                 item.get("content_b64"),
-                item.get("content_sha256"),
+                sha_for_row,
                 item.get("size"),
             ),
         )

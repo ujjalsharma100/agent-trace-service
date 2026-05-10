@@ -29,6 +29,12 @@ Routes:
     DELETE /api/v1/tokens/<id>                 (admin: revoke)
     POST   /api/v1/tokens/verify               (verify a presented token)
 
+    POST   /api/v1/orgs                        (admin: register an org)
+
+    POST   /api/v1/projects                    (admin or org-scoped + projects:write)
+    GET    /api/v1/projects                    (list projects in caller's org)
+    GET    /api/v1/projects/<project_id>       (project metadata)
+
     GET    /api/v1/version
     GET    /health
 
@@ -94,7 +100,13 @@ def require_admin(f):
 
 
 def _project_id_from_request() -> tuple[str | None, tuple[Response, int] | None]:
-    """Resolve the request's project_id and ensure the token scope permits it."""
+    """Resolve the request's project_id, check the token scope, and verify
+    the project is registered.
+
+    Returns ``(project_id, None)`` on success or ``(None, error_response)``.
+    Sync routes are no longer permitted to lazily create projects — clients
+    must register via ``POST /api/v1/projects`` first.
+    """
     project_id = request.args.get("project_id")
     if project_id is None and request.method in ("POST",):
         body = request.get_json(silent=True) or {}
@@ -103,6 +115,16 @@ def _project_id_from_request() -> tuple[str | None, tuple[Response, int] | None]
         return None, (jsonify({"error": "project_id is required"}), 400)
     if not service.assert_project_in_token_scope(g.token_ctx, project_id):
         return None, (jsonify({"error": "Token is not scoped to this project"}), 403)
+    try:
+        db_service.assert_project_exists(g.org_id, project_id)
+    except db_service.ProjectNotFoundError:
+        return None, (jsonify({
+            "error": (
+                f"Project {project_id!r} is not registered. "
+                "Call POST /api/v1/projects (or `agent-trace project create <url>`) first."
+            ),
+            "code": "project_not_found",
+        }), 404)
     return project_id, None
 
 
@@ -132,6 +154,10 @@ def root():
             "blob_get": "GET /api/v1/blobs/<sha256>",
             "tokens_admin": "POST/GET /api/v1/tokens, DELETE /api/v1/tokens/<id> (X-Admin-Secret)",
             "tokens_verify": "POST /api/v1/tokens/verify",
+            "orgs_create": "POST /api/v1/orgs (X-Admin-Secret)",
+            "projects_create": "POST /api/v1/projects (org-scoped + projects:write, or X-Admin-Secret)",
+            "projects_list": "GET /api/v1/projects",
+            "projects_get": "GET /api/v1/projects/<project_id>",
         },
     })
 
@@ -220,6 +246,100 @@ def orgs_create():
         return jsonify(existing.to_dict()), 200
     org = db_service.create_org(slug=slug, name=body.get("name"))
     return jsonify(org.to_dict()), 201
+
+
+# ===================================================================
+# Projects — registration + read
+# ===================================================================
+#
+# Project identity is the wire ``project_id`` slug, scoped within an org by
+# the (org_id, project_id) UNIQUE on ``projects``. The remote URL the CLI
+# binds to has the shape ``<scheme>://<host>/<org_slug>/<project_id>``.
+# Registration is explicit: clients must POST here (or rely on the implicit
+# upsert during sync, which only the admin path uses) before pushing data.
+
+def _resolve_caller_for_project_admin() -> tuple[str | None, tuple[Response, int] | None]:
+    """Resolve the org_id of the caller for project-admin routes.
+
+    Honours either:
+      - ``X-Admin-Secret`` matching ``ADMIN_SECRET`` plus ``org_id`` in body or
+        query (admin can act for any org), or
+      - a Bearer token that is org-scoped and has ``projects:write``.
+
+    Returns ``(org_id, None)`` on success or ``(None, error_response)``.
+    """
+    admin_secret = request.headers.get("X-Admin-Secret", "")
+    if admin_secret and admin_secret == service.ADMIN_SECRET:
+        body = request.get_json(silent=True) or {}
+        org_id = body.get("org_id") or request.args.get("org_id") or db_service.DEFAULT_ORG_ID
+        if db_service.get_org_by_id(org_id) is None:
+            return None, (jsonify({"error": f"Org {org_id!r} does not exist"}), 404)
+        return org_id, None
+
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None, (
+            jsonify({"error": "Project admin requires X-Admin-Secret or org-scoped Bearer token"}),
+            401,
+        )
+    ctx = service.resolve_token(auth[7:])
+    if ctx is None:
+        return None, (jsonify({"error": "Invalid or revoked token"}), 401)
+    if not service.can_create_project(ctx):
+        return None, (
+            jsonify({
+                "error": "Token must be org-scoped (no project_id_scope) and carry the "
+                         "'projects:write' scope. Admin can also use X-Admin-Secret."
+            }),
+            403,
+        )
+    return ctx.org_id, None
+
+
+@app.route("/api/v1/projects", methods=["POST"])
+def projects_create():
+    org_id, err = _resolve_caller_for_project_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    project_id = body.get("project_id")
+    if not project_id:
+        return jsonify({"error": "project_id is required"}), 400
+    try:
+        proj = db_service.create_project(
+            org_id=org_id,
+            project_id=project_id,
+            name=body.get("name"),
+            description=body.get("description"),
+        )
+    except db_service.ProjectExistsError:
+        return jsonify({
+            "error": f"Project {project_id!r} already exists in this org",
+            "code": "project_exists",
+        }), 409
+    except db_service.InvalidProjectSlugError as e:
+        return jsonify({"error": str(e), "code": "invalid_slug"}), 400
+    return jsonify(proj.to_dict()), 201
+
+
+@app.route("/api/v1/projects", methods=["GET"])
+@require_auth
+def projects_list():
+    items = db_service.list_projects(g.org_id)
+    if g.project_id_scope is not None:
+        items = [p for p in items if p.project_id == g.project_id_scope]
+    return jsonify({"items": [p.to_dict() for p in items]})
+
+
+@app.route("/api/v1/projects/<project_id>", methods=["GET"])
+@require_auth
+def projects_get(project_id):
+    if not service.assert_project_in_token_scope(g.token_ctx, project_id):
+        return jsonify({"error": "Token is not scoped to this project"}), 403
+    proj = db_service.get_project(g.org_id, project_id)
+    if proj is None:
+        return jsonify({"error": "Project not found"}), 404
+    return jsonify(proj.to_dict())
 
 
 # ===================================================================
@@ -334,7 +454,13 @@ def sync_conversations_push():
     if err:
         return err
 
-    count = service.sync_upsert_conversations(g.org_id, project_id, g.user_id, items)
+    try:
+        count = service.sync_upsert_conversations(g.org_id, project_id, g.user_id, items)
+    except db_service.MissingBlobForConversationError as e:
+        return jsonify({
+            "error": "Referenced blob is missing; upload it via POST /api/v1/blobs first",
+            "content_sha256": e.sha256,
+        }), 400
     return jsonify({"ok": True, "count": count}), 200
 
 

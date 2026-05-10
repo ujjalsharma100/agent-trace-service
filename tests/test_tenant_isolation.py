@@ -70,7 +70,8 @@ class TestTenantIsolation(unittest.TestCase):
 
         self.org_a_slug = f"isolation-test-a-{self.suffix}"
         self.org_b_slug = f"isolation-test-b-{self.suffix}"
-        self.project_id = f"-tenant-isolation-{self.suffix}"
+        # Slug-shape project_id (must match ^[a-z0-9][a-z0-9._-]{0,63}$).
+        self.project_id = f"tenant-isolation-{self.suffix}"
 
         # Create two orgs.
         s, org_a = _http(
@@ -85,6 +86,16 @@ class TestTenantIsolation(unittest.TestCase):
         self.assertIn(s, (200, 201), org_b)
         self.org_a_id = org_a["id"]
         self.org_b_id = org_b["id"]
+
+        # Register the same-named project under both orgs (the load-bearing
+        # collision we want to verify isolation against).
+        for org_id in (self.org_a_id, self.org_b_id):
+            s, payload = _http(
+                "POST", f"{self.base}/api/v1/projects",
+                body={"org_id": org_id, "project_id": self.project_id},
+                headers=self.admin,
+            )
+            self.assertEqual(s, 201, payload)
 
         # Mint one token per org, both org-scoped.
         s, tok_a = _http(

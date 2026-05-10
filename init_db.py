@@ -44,7 +44,7 @@ SQL_FILES = [
 ]
 
 # Bumped whenever sql/ contents change. Surfaced via /health and /api/v1/version.
-SCHEMA_VERSION = "002-multitenancy"
+SCHEMA_VERSION = "003-project-slugs"
 
 SQL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sql")
 

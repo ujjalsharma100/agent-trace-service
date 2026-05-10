@@ -154,6 +154,34 @@ curl -X POST http://localhost:5000/api/v1/tokens \
 |--------|------|------|-------------|
 | `POST` | `/api/v1/orgs` | `X-Admin-Secret` | Create or fetch an org by slug |
 
+### Projects
+
+Projects are explicit. The wire `project_id` is a slug matching `^[a-z0-9][a-z0-9._-]{0,63}$`, unique per org. CLIs bind to URLs of the form `<scheme>://<host>/<org_slug>/<project_id>`; the slug must be registered before sync routes accept traffic for it (otherwise they return `404 project_not_found`).
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/api/v1/projects` | `X-Admin-Secret` **or** org-scoped token with `projects:write` | Register a project under `(org_id, project_id)`. 201 on create, 409 on conflict, 400 on bad slug. |
+| `GET` | `/api/v1/projects` | Bearer token | List projects in caller's org (project-scoped tokens see only their bound project). |
+| `GET` | `/api/v1/projects/<project_id>` | Bearer token | Project metadata. 404 if missing or scope-blocked. |
+
+Issue an org-scoped token with the right scope:
+
+```bash
+curl -X POST $URL/api/v1/tokens \
+    -H "X-Admin-Secret: $ADMIN_SECRET" \
+    -H "Content-Type: application/json" \
+    -d '{"org_id": "<ORG_UUID>", "name": "ci", "scopes": ["read","write","projects:write"]}'
+```
+
+Then register a project with that token (or directly via `X-Admin-Secret` for the default-org path):
+
+```bash
+curl -X POST $URL/api/v1/projects \
+    -H "Authorization: Bearer $AT_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"project_id": "myrepo", "name": "My Repo"}'
+```
+
 ### Sync (primary path for CLI `push` / `pull`)
 
 Bulk upsert (**POST**, JSON body with `project_id` and `items`) and incremental pull (**GET**, `project_id`, `since`, `limit`).

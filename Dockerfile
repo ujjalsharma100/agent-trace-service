@@ -1,4 +1,5 @@
-# Minimal image for local / CI integration tests (see agent-trace-cli/tests/docker-compose.test.yml).
+# Minimal image for local dev (docker-compose.dev.yml), CLI CI tests
+# (agent-trace-cli/tests/docker-compose.test.yml), and production-style runs.
 FROM python:3.12-slim-bookworm
 
 WORKDIR /app
