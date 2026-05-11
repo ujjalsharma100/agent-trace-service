@@ -1,15 +1,16 @@
 -- =========================================================================
 -- Conversation contents table
 --
--- Stores transcript pointers / inline content for conversation URLs found
--- in trace records. Two storage modes coexist:
+-- Stores transcript pointers / inline content keyed by ``conversation_id``
+-- (sha256 over the original local transcript URL). Two storage modes
+-- coexist:
 --
 --   * Inline ``content`` (or ``content_b64`` for binary) for blobs below
 --     the chunk threshold. Kept here for round-trip simplicity.
 --   * Pointer to ``blobs.sha256`` for chunked uploads. The CLI HEAD/POSTs
 --     to ``/api/v1/blobs`` first; this row only carries the hash.
 --
--- Scoped by (org_id, project_id, url).
+-- Scoped by (org_id, project_id, conversation_id).
 -- =========================================================================
 
 CREATE TABLE IF NOT EXISTS conversation_contents (
@@ -18,7 +19,7 @@ CREATE TABLE IF NOT EXISTS conversation_contents (
     project_id      TEXT NOT NULL,
     user_id         TEXT NOT NULL,
 
-    url             TEXT NOT NULL,                     -- url_hash from CLI
+    conversation_id TEXT NOT NULL,
 
     -- Inline storage (small blobs, < CHUNK_THRESHOLD)
     content         TEXT,
@@ -31,7 +32,7 @@ CREATE TABLE IF NOT EXISTS conversation_contents (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    UNIQUE (org_id, project_id, url),
+    UNIQUE (org_id, project_id, conversation_id),
     FOREIGN KEY (org_id, project_id) REFERENCES projects (org_id, project_id) ON DELETE CASCADE
 );
 

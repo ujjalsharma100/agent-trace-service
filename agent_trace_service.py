@@ -267,7 +267,8 @@ def sync_upsert_conversations(
 ) -> int:
     """Upsert a batch of conversation pointers / inline content.
 
-    Items may include any of:
+    Items must carry a ``conversation_id`` (sha256 over the original local
+    transcript URL). Payload may include any of:
       - ``content``        — inline UTF-8 text (small blobs)
       - ``content_b64``    — inline base64 (binary small blobs)
       - ``content_sha256`` — pointer to a previously-uploaded blob
@@ -276,9 +277,32 @@ def sync_upsert_conversations(
         return 0
     db.assert_project_exists(org_id, project_id)
     for item in items:
-        if not item.get("url") and not item.get("url_hash"):
+        if not item.get("conversation_id"):
             continue
         db.upsert_conversation_pointer(org_id, project_id, user_id, item)
+    return len(items)
+
+
+def sync_upsert_summaries(
+    org_id: str,
+    project_id: str,
+    user_id: str,
+    items: list[dict[str, Any]],
+) -> int:
+    """Upsert a batch of conversation summary rows.
+
+    Items require ``conversation_id``, ``summary``, ``created_at``; ``session_id``
+    is optional. Upserts on (org, project, conversation_id, created_at).
+    """
+    if not items:
+        return 0
+    db.assert_project_exists(org_id, project_id)
+    for item in items:
+        if not item.get("conversation_id") or not item.get("summary"):
+            continue
+        if not (item.get("created_at") or item.get("updated_at")):
+            continue
+        db.upsert_conversation_summary(org_id, project_id, user_id, item)
     return len(items)
 
 

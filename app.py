@@ -10,15 +10,17 @@ Routes:
     POST   /api/v1/sync/ledgers
     POST   /api/v1/sync/commit-links
     POST   /api/v1/sync/conversations
+    POST   /api/v1/sync/summaries
 
     GET    /api/v1/sync/traces?project_id=&since=&limit=
     GET    /api/v1/sync/ledgers?project_id=&since=&limit=
     GET    /api/v1/sync/commit-links?project_id=&since=&limit=
     GET    /api/v1/sync/conversations?project_id=&since=&limit=
+    GET    /api/v1/sync/summaries?project_id=&since=&limit=
 
     GET    /api/v1/traces/<id>?project_id=
     GET    /api/v1/ledgers/<commit_sha>?project_id=
-    GET    /api/v1/conversations/<url_hash>?project_id=
+    GET    /api/v1/conversations/<conversation_id>?project_id=
 
     HEAD   /api/v1/blobs/<sha256>
     POST   /api/v1/blobs                       (raw body)
@@ -146,9 +148,10 @@ def root():
             "sync_ledgers": "POST/GET /api/v1/sync/ledgers",
             "sync_commit_links": "POST/GET /api/v1/sync/commit-links",
             "sync_conversations": "POST/GET /api/v1/sync/conversations",
+            "sync_summaries": "POST/GET /api/v1/sync/summaries",
             "get_trace": "GET /api/v1/traces/<id>?project_id=",
             "get_ledger": "GET /api/v1/ledgers/<commit_sha>?project_id=",
-            "get_conversation": "GET /api/v1/conversations/<url_hash>?project_id=",
+            "get_conversation": "GET /api/v1/conversations/<conversation_id>?project_id=",
             "blob_head": "HEAD /api/v1/blobs/<sha256>",
             "blob_post": "POST /api/v1/blobs",
             "blob_get": "GET /api/v1/blobs/<sha256>",
@@ -480,6 +483,37 @@ def sync_conversations_pull():
 
 
 # ===================================================================
+# Sync — Summaries
+# ===================================================================
+
+@app.route("/api/v1/sync/summaries", methods=["POST"])
+@require_auth
+def sync_summaries_push():
+    body = request.get_json(silent=True) or {}
+    items = body.get("items", [])
+    project_id, err = _project_id_from_request()
+    if err:
+        return err
+    count = service.sync_upsert_summaries(g.org_id, project_id, g.user_id, items)
+    return jsonify({"ok": True, "count": count}), 200
+
+
+@app.route("/api/v1/sync/summaries", methods=["GET"])
+@require_auth
+def sync_summaries_pull():
+    project_id, err = _project_id_from_request()
+    if err:
+        return err
+    since = request.args.get("since", "")
+    limit = min(int(request.args.get("limit", "500")), 1000)
+
+    items, max_timestamp = db_service.list_summaries_since(
+        g.org_id, project_id, since=since, limit=limit,
+    )
+    return jsonify({"items": items, "max_timestamp": max_timestamp})
+
+
+# ===================================================================
 # Direct fetch by ID (read-only)
 # ===================================================================
 
@@ -507,16 +541,16 @@ def get_ledger(commit_sha):
     return jsonify(ledger)
 
 
-@app.route("/api/v1/conversations/<path:url_hash>", methods=["GET"])
+@app.route("/api/v1/conversations/<path:conversation_id>", methods=["GET"])
 @require_auth
-def get_conversation(url_hash):
+def get_conversation(conversation_id):
     project_id, err = _project_id_from_request()
     if err:
         return err
-    pointer = db_service.get_conversation_pointer(g.org_id, project_id, url_hash)
+    pointer = db_service.get_conversation_pointer(g.org_id, project_id, conversation_id)
     if pointer is None:
         return jsonify({"error": "Conversation not found"}), 404
-    return jsonify({"url": url_hash, **pointer})
+    return jsonify(pointer)
 
 
 # ===================================================================

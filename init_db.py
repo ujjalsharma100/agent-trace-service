@@ -40,11 +40,12 @@ SQL_FILES = [
     "blobs.sql",
     "traces.sql",
     "conversation_contents.sql",
+    "conversation_summaries.sql",
     "commit_links.sql",
 ]
 
 # Bumped whenever sql/ contents change. Surfaced via /health and /api/v1/version.
-SCHEMA_VERSION = "004-traces-created-at-idx"
+SCHEMA_VERSION = "005-conversation-id-and-summaries"
 
 SQL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sql")
 
@@ -75,6 +76,7 @@ def drop_tables(conn):
     with conn.cursor() as cur:
         cur.execute("""
             DROP TABLE IF EXISTS commit_links CASCADE;
+            DROP TABLE IF EXISTS conversation_summaries CASCADE;
             DROP TABLE IF EXISTS conversation_contents CASCADE;
             DROP TABLE IF EXISTS traces CASCADE;
             DROP TABLE IF EXISTS blobs CASCADE;
@@ -102,6 +104,7 @@ def show_status(conn):
         "blobs",
         "traces",
         "conversation_contents",
+        "conversation_summaries",
         "commit_links",
     ]
     print("Database status:\n")

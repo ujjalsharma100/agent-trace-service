@@ -201,7 +201,7 @@ Bulk upsert (**POST**, JSON body with `project_id` and `items`) and incremental 
 |--------|------|-------------|
 | `GET` | `/api/v1/traces/<trace_id>?project_id=` | Single trace JSON |
 | `GET` | `/api/v1/ledgers/<commit_sha>?project_id=` | Ledger JSON for a commit (404 if missing) |
-| `GET` | `/api/v1/conversations/<url_hash>?project_id=` | Conversation pointer + inline content (or sha + size) |
+| `GET` | `/api/v1/conversations/<conversation_id>?project_id=` | Conversation pointer + inline content (or sha + size) |
 
 Query-parameter names match `app.py` (see source for exact spelling).
 

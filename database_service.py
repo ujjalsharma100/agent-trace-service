@@ -764,8 +764,8 @@ def upsert_conversation_pointer(
     ``blobs(sha256)``: when inline bytes are present we insert (or dedupe) the
     blob before upserting the row so the foreign key holds.
     """
-    url = item.get("url") or item.get("url_hash")
-    if not url:
+    conversation_id = item.get("conversation_id")
+    if not conversation_id:
         return
 
     raw = _inline_payload_bytes(item)
@@ -783,11 +783,11 @@ def upsert_conversation_pointer(
         cur.execute(
             """
             INSERT INTO conversation_contents (
-                org_id, project_id, user_id, url,
+                org_id, project_id, user_id, conversation_id,
                 content, content_b64, content_sha256, size
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (org_id, project_id, url) DO UPDATE SET
+            ON CONFLICT (org_id, project_id, conversation_id) DO UPDATE SET
                 content        = EXCLUDED.content,
                 content_b64    = EXCLUDED.content_b64,
                 content_sha256 = EXCLUDED.content_sha256,
@@ -798,7 +798,7 @@ def upsert_conversation_pointer(
                 org_id,
                 project_id,
                 user_id,
-                url,
+                conversation_id,
                 item.get("content"),
                 item.get("content_b64"),
                 sha_for_row,
@@ -819,7 +819,7 @@ def list_conversations_since(
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         if since:
             cur.execute(
-                """SELECT url, content, content_b64, content_sha256, size, updated_at
+                """SELECT conversation_id, content, content_b64, content_sha256, size, updated_at
                    FROM conversation_contents
                    WHERE org_id = %s AND project_id = %s AND updated_at > %s
                    ORDER BY updated_at ASC LIMIT %s""",
@@ -827,7 +827,7 @@ def list_conversations_since(
             )
         else:
             cur.execute(
-                """SELECT url, content, content_b64, content_sha256, size, updated_at
+                """SELECT conversation_id, content, content_b64, content_sha256, size, updated_at
                    FROM conversation_contents
                    WHERE org_id = %s AND project_id = %s
                    ORDER BY updated_at ASC LIMIT %s""",
@@ -838,7 +838,7 @@ def list_conversations_since(
     items: list[dict[str, Any]] = []
     max_ts = None
     for row in rows:
-        item: dict[str, Any] = {"url": row["url"], "url_hash": row["url"]}
+        item: dict[str, Any] = {"conversation_id": row["conversation_id"]}
         if row["content"] is not None:
             item["content"] = row["content"]
         if row["content_b64"] is not None:
@@ -857,23 +857,116 @@ def list_conversations_since(
 def get_conversation_pointer(
     org_id: str,
     project_id: str,
-    url: str,
+    conversation_id: str,
 ) -> dict[str, Any] | None:
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """SELECT url, content, content_b64, content_sha256, size
+            """SELECT conversation_id, content, content_b64, content_sha256, size
                FROM conversation_contents
-               WHERE org_id = %s AND project_id = %s AND url = %s LIMIT 1""",
-            (org_id, project_id, url),
+               WHERE org_id = %s AND project_id = %s AND conversation_id = %s LIMIT 1""",
+            (org_id, project_id, conversation_id),
         )
         row = cur.fetchone()
     if not row:
         return None
     return {
-        "url": row["url"],
+        "conversation_id": row["conversation_id"],
         "content": row["content"],
         "content_b64": row["content_b64"],
         "content_sha256": row["content_sha256"],
         "size": row["size"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Conversation summaries — CRUD + sync pagination
+# ---------------------------------------------------------------------------
+
+def upsert_conversation_summary(
+    org_id: str,
+    project_id: str,
+    user_id: str,
+    item: dict[str, Any],
+) -> None:
+    """Insert or update a conversation summary row.
+
+    Required item fields: ``conversation_id``, ``summary``, ``created_at``.
+    Optional: ``session_id``. Upserts on (org, project, conversation_id, created_at).
+    """
+    conversation_id = item.get("conversation_id")
+    summary = item.get("summary")
+    created_at = item.get("created_at") or item.get("updated_at")
+    if not conversation_id or not summary or not created_at:
+        return
+
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO conversation_summaries (
+                org_id, project_id, user_id, conversation_id,
+                summary, session_id, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (org_id, project_id, conversation_id, created_at) DO UPDATE SET
+                summary    = EXCLUDED.summary,
+                session_id = EXCLUDED.session_id,
+                updated_at = NOW()
+            """,
+            (
+                org_id,
+                project_id,
+                user_id,
+                conversation_id,
+                summary,
+                item.get("session_id"),
+                created_at,
+            ),
+        )
+
+
+def list_summaries_since(
+    org_id: str,
+    project_id: str,
+    *,
+    since: str = "",
+    limit: int = 500,
+) -> tuple[list[Any], str | None]:
+    """Return summary rows newer than ``since`` (by updated_at)."""
+    db = get_db()
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if since:
+            cur.execute(
+                """SELECT conversation_id, summary, session_id, created_at, updated_at
+                   FROM conversation_summaries
+                   WHERE org_id = %s AND project_id = %s AND updated_at > %s
+                   ORDER BY updated_at ASC LIMIT %s""",
+                (org_id, project_id, since, limit),
+            )
+        else:
+            cur.execute(
+                """SELECT conversation_id, summary, session_id, created_at, updated_at
+                   FROM conversation_summaries
+                   WHERE org_id = %s AND project_id = %s
+                   ORDER BY updated_at ASC LIMIT %s""",
+                (org_id, project_id, limit),
+            )
+        rows = cur.fetchall()
+
+    items: list[dict[str, Any]] = []
+    max_ts = None
+    for row in rows:
+        item: dict[str, Any] = {
+            "conversation_id": row["conversation_id"],
+            "summary": row["summary"],
+        }
+        if row["session_id"]:
+            item["session_id"] = row["session_id"]
+        if row["created_at"]:
+            item["created_at"] = row["created_at"].isoformat()
+        if row["updated_at"]:
+            item["updated_at"] = row["updated_at"].isoformat()
+            max_ts = row["updated_at"].isoformat()
+        items.append(item)
+    return items, max_ts
