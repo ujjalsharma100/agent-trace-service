@@ -205,6 +205,119 @@ class TestProjectRegistration(unittest.TestCase):
         self.assertEqual(s, 404, payload)
         self.assertEqual(payload.get("code"), "project_not_found")
 
+    # -- org_slug enforcement on POST /api/v1/projects ---------------------
+
+    def test_org_scoped_token_rejects_wrong_org_slug(self) -> None:
+        """A token from one org cannot register a project under another org's
+        slug. Without this check the row would land under the token's org and
+        local CLI state would silently disagree with the database.
+        """
+        # Make a second org we don't own a token for.
+        other_slug = f"other-org-{self.suffix}"
+        s, _ = _http(
+            "POST", f"{self.base}/api/v1/orgs",
+            body={"slug": other_slug}, headers=self.admin,
+        )
+        self.assertIn(s, (200, 201))
+
+        token = self._mint_token(scopes=["read", "write", "projects:write"])
+        s, payload = _http(
+            "POST", f"{self.base}/api/v1/projects",
+            body={"project_id": f"crossorg-{self.suffix}", "org_slug": other_slug},
+            headers=self._bearer(token),
+        )
+        self.assertEqual(s, 403, payload)
+        self.assertEqual(payload.get("code"), "org_slug_mismatch")
+        self.assertEqual(payload.get("expected"), self.org_slug)
+        self.assertEqual(payload.get("got"), other_slug)
+
+    def test_org_scoped_token_accepts_matching_org_slug(self) -> None:
+        token = self._mint_token(scopes=["read", "write", "projects:write"])
+        slug = f"matching-{self.suffix}"
+        s, payload = _http(
+            "POST", f"{self.base}/api/v1/projects",
+            body={"project_id": slug, "org_slug": self.org_slug},
+            headers=self._bearer(token),
+        )
+        self.assertEqual(s, 201, payload)
+        self.assertEqual(payload["project_id"], slug)
+
+    def test_admin_with_org_slug_resolves_org(self) -> None:
+        """Admin can pass ``org_slug`` instead of ``org_id`` and the server
+        looks the org up; both forms reach the same row.
+        """
+        slug = f"admin-by-slug-{self.suffix}"
+        s, payload = _http(
+            "POST", f"{self.base}/api/v1/projects",
+            body={"project_id": slug, "org_slug": self.org_slug},
+            headers=self.admin,
+        )
+        self.assertEqual(s, 201, payload)
+        self.assertEqual(payload["org_id"], self.org_id)
+
+    def test_admin_org_slug_and_org_id_must_agree(self) -> None:
+        other_slug = f"admin-mismatch-{self.suffix}"
+        s, other_org = _http(
+            "POST", f"{self.base}/api/v1/orgs",
+            body={"slug": other_slug}, headers=self.admin,
+        )
+        self.assertIn(s, (200, 201))
+
+        s, payload = _http(
+            "POST", f"{self.base}/api/v1/projects",
+            body={
+                "project_id": f"badmix-{self.suffix}",
+                "org_id": self.org_id,
+                "org_slug": other_slug,
+            },
+            headers=self.admin,
+        )
+        self.assertEqual(s, 400, payload)
+        self.assertEqual(payload.get("code"), "org_slug_mismatch")
+
+    def test_admin_unknown_org_slug_404(self) -> None:
+        s, payload = _http(
+            "POST", f"{self.base}/api/v1/projects",
+            body={"project_id": "x", "org_slug": f"never-existed-{self.suffix}"},
+            headers=self.admin,
+        )
+        self.assertEqual(s, 404, payload)
+        self.assertEqual(payload.get("code"), "org_not_found")
+
+    # -- whoami ------------------------------------------------------------
+
+    def test_whoami_returns_org_scope(self) -> None:
+        token = self._mint_token(scopes=["read", "write"])
+        s, payload = _http(
+            "GET", f"{self.base}/api/v1/auth/whoami",
+            headers=self._bearer(token),
+        )
+        self.assertEqual(s, 200, payload)
+        self.assertEqual(payload["org_id"], self.org_id)
+        self.assertEqual(payload["org_slug"], self.org_slug)
+        self.assertIsNone(payload["project_id_scope"])
+        self.assertIn("read", payload["scopes"])
+
+    def test_whoami_returns_project_scope(self) -> None:
+        target = f"whoami-target-{self.suffix}"
+        _http(
+            "POST", f"{self.base}/api/v1/projects",
+            body={"org_id": self.org_id, "project_id": target}, headers=self.admin,
+        )
+        token = self._mint_token(project_id=target)
+        s, payload = _http(
+            "GET", f"{self.base}/api/v1/auth/whoami",
+            headers=self._bearer(token),
+        )
+        self.assertEqual(s, 200, payload)
+        self.assertEqual(payload["project_id_scope"], target)
+
+    def test_whoami_requires_auth(self) -> None:
+        s, payload = _http(
+            "GET", f"{self.base}/api/v1/auth/whoami",
+        )
+        self.assertEqual(s, 401, payload)
+
 
 if __name__ == "__main__":
     unittest.main()

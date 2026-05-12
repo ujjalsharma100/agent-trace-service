@@ -31,6 +31,8 @@ Routes:
     DELETE /api/v1/tokens/<id>                 (admin: revoke)
     POST   /api/v1/tokens/verify               (verify a presented token)
 
+    GET    /api/v1/auth/whoami                 (resolved scope for the bearer)
+
     POST   /api/v1/orgs                        (admin: register an org)
 
     POST   /api/v1/projects                    (admin or org-scoped + projects:write)
@@ -157,6 +159,7 @@ def root():
             "blob_get": "GET /api/v1/blobs/<sha256>",
             "tokens_admin": "POST/GET /api/v1/tokens, DELETE /api/v1/tokens/<id> (X-Admin-Secret)",
             "tokens_verify": "POST /api/v1/tokens/verify",
+            "auth_whoami": "GET /api/v1/auth/whoami",
             "orgs_create": "POST /api/v1/orgs (X-Admin-Secret)",
             "projects_create": "POST /api/v1/projects (org-scoped + projects:write, or X-Admin-Secret)",
             "projects_list": "GET /api/v1/projects",
@@ -234,6 +237,23 @@ def tokens_verify():
 
 
 # ===================================================================
+# Auth — whoami
+# ===================================================================
+#
+# Cheap, well-known endpoint a client can call to confirm the resolved scope
+# (org_id, org_slug, project_id_scope, scopes) of the bearer it's about to
+# use. The CLI uses this for pre-flight checks: if the URL the user typed
+# carries an ``<org_slug>/<project_slug>`` that disagrees with the token's
+# real scope, we want to fail loudly *before* writing data under a different
+# org than the user expected.
+
+@app.route("/api/v1/auth/whoami", methods=["GET"])
+@require_auth
+def auth_whoami():
+    return jsonify(service.whoami(g.token_ctx))
+
+
+# ===================================================================
 # Orgs (admin-only convenience helpers)
 # ===================================================================
 
@@ -265,16 +285,42 @@ def _resolve_caller_for_project_admin() -> tuple[str | None, tuple[Response, int
     """Resolve the org_id of the caller for project-admin routes.
 
     Honours either:
-      - ``X-Admin-Secret`` matching ``ADMIN_SECRET`` plus ``org_id`` in body or
-        query (admin can act for any org), or
-      - a Bearer token that is org-scoped and has ``projects:write``.
+      - ``X-Admin-Secret`` matching ``ADMIN_SECRET`` plus ``org_id`` and/or
+        ``org_slug`` in body or query. ``org_slug`` is preferred when present
+        — admin tooling should refer to orgs by their human slug rather than
+        a UUID — and if both are given they must point at the same org.
+      - a Bearer token that is org-scoped and has ``projects:write``. If the
+        body carries an ``org_slug``, it must match the slug of the token's
+        org or we return 403 ``org_slug_mismatch``.
 
     Returns ``(org_id, None)`` on success or ``(None, error_response)``.
     """
+    body = request.get_json(silent=True) or {}
+    body_org_slug = body.get("org_slug") or request.args.get("org_slug")
+
     admin_secret = request.headers.get("X-Admin-Secret", "")
     if admin_secret and admin_secret == service.ADMIN_SECRET:
-        body = request.get_json(silent=True) or {}
-        org_id = body.get("org_id") or request.args.get("org_id") or db_service.DEFAULT_ORG_ID
+        org_id = body.get("org_id") or request.args.get("org_id")
+        org_obj = None
+        if body_org_slug:
+            org_obj = db_service.get_org_by_slug(body_org_slug)
+            if org_obj is None:
+                return None, (jsonify({
+                    "error": f"Org with slug {body_org_slug!r} does not exist",
+                    "code": "org_not_found",
+                }), 404)
+            if org_id and str(org_obj.id) != org_id:
+                return None, (jsonify({
+                    "error": (
+                        f"org_id and org_slug refer to different orgs: "
+                        f"slug {body_org_slug!r} resolves to {org_obj.id} "
+                        f"but org_id was {org_id!r}"
+                    ),
+                    "code": "org_slug_mismatch",
+                }), 400)
+            return str(org_obj.id), None
+        # No slug provided; fall back to org_id (or default).
+        org_id = org_id or db_service.DEFAULT_ORG_ID
         if db_service.get_org_by_id(org_id) is None:
             return None, (jsonify({"error": f"Org {org_id!r} does not exist"}), 404)
         return org_id, None
@@ -296,6 +342,20 @@ def _resolve_caller_for_project_admin() -> tuple[str | None, tuple[Response, int
             }),
             403,
         )
+    if body_org_slug:
+        caller_org = db_service.get_org_by_id(ctx.org_id)
+        caller_slug = caller_org.slug if caller_org else None
+        if caller_slug != body_org_slug:
+            return None, (jsonify({
+                "error": (
+                    f"Token belongs to org {caller_slug!r} but request targets "
+                    f"org {body_org_slug!r}. The org slug in the URL must match "
+                    "the token's org."
+                ),
+                "code": "org_slug_mismatch",
+                "expected": caller_slug,
+                "got": body_org_slug,
+            }), 403)
     return ctx.org_id, None
 
 

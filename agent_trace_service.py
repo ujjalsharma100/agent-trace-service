@@ -100,12 +100,33 @@ def verify_token(token: str) -> tuple[dict[str, Any], bool]:
     ctx = db.lookup_token_by_hash(_hash_token(token))
     if ctx is None:
         return {"valid": False, "error": "Invalid or revoked token"}, False
+    # ``org_slug`` is included so CLI clients can verify the URL's
+    # ``<org_slug>/<project_slug>`` matches the token's actual scope without
+    # leaking other org metadata.
+    org = db.get_org_by_id(ctx.org_id)
     return {
         "valid": True,
         "org_id": ctx.org_id,
+        "org_slug": org.slug if org else None,
         "project_id": ctx.project_id_scope,
         "scopes": ctx.scopes,
     }, True
+
+
+def whoami(ctx: TokenContext) -> dict[str, Any]:
+    """Return the resolved auth context shape used by ``GET /api/v1/auth/whoami``.
+
+    Distinct from ``verify_token`` (which takes a plaintext body and walks the
+    same lookup) — this one takes an already-resolved ``TokenContext`` so the
+    route handler can reuse ``g.token_ctx`` without a second hash lookup.
+    """
+    org = db.get_org_by_id(ctx.org_id)
+    return {
+        "org_id": ctx.org_id,
+        "org_slug": org.slug if org else None,
+        "project_id_scope": ctx.project_id_scope,
+        "scopes": ctx.scopes,
+    }
 
 
 def resolve_token(token: str) -> TokenContext | None:
@@ -140,6 +161,33 @@ def version_info() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Project guard
 # ---------------------------------------------------------------------------
+
+class OrgSlugMismatchError(Exception):
+    """Caller-supplied ``org_slug`` doesn't match the slug owning the request.
+
+    Raised whenever a body / URL ``org_slug`` is checked against the slug of
+    the org the bearer token (or the resolved admin ``org_id``) actually
+    points at. Carries both sides so the route can return a structured 403.
+    """
+
+    def __init__(self, expected: str, got: str) -> None:
+        self.expected = expected
+        self.got = got
+        super().__init__(
+            f"org_slug {got!r} does not match the caller's org slug {expected!r}"
+        )
+
+
+class ProjectScopeMismatchError(Exception):
+    """``project_id`` in the request lies outside a project-scoped token's reach."""
+
+    def __init__(self, scope: str, got: str) -> None:
+        self.scope = scope
+        self.got = got
+        super().__init__(
+            f"project_id {got!r} is outside this token's scope {scope!r}"
+        )
+
 
 def assert_project_in_token_scope(ctx: TokenContext, project_id: str) -> bool:
     """Project-scoped tokens may only act on their bound project."""
