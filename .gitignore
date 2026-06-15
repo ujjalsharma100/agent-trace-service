@@ -1,27 +1,26 @@
-# Secrets / env
-infra/secrets/
-*.pem
-.env
-.env.*
-!.env.example
-
 # Python
 __pycache__/
 *.py[cod]
-.venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 *.egg-info/
-.hypothesis/
-
-# Node / web
-node_modules/
 dist/
-.vite/
-*.local
+build/
+*.egg
+.venv/
+venv/
+env/
 
-# OS / editor
-.DS_Store
-.idea/
+# Environment
+.env
+
+# IDE
 .vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
