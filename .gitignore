@@ -1,0 +1,27 @@
+# Secrets / env
+infra/secrets/
+*.pem
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.hypothesis/
+
+# Node / web
+node_modules/
+dist/
+.vite/
+*.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
