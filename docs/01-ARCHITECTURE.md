@@ -200,6 +200,10 @@ psycopg2 (it's the vendored OSS service — don't rewrite it).
   `agent-trace-service`; managed Postgres (two logical DBs); object storage (S3)
   for large transcripts when the blob backend graduates off inline `bytea`.
 - **Self-host:** one `docker-compose.yml` — `db` (postgres:16), `tracehub-api`
-  (:8000), `agent-trace-service` (:5050), `tracehub-web`. Mirrors Curio's dev
-  compose minus decision-backend/decision-mcp. Shared `ADMIN_SECRET` (hub ↔
-  service provisioning) and `AGENT_TRACE_GATEWAY_SECRET` (gateway HMAC).
+  (hub listens on container port `8000`), `agent-trace-service` (container
+  `5050`), `tracehub-web`. When developing **on the same machine as Curio**,
+  publish **different host ports** than Curio’s compose (see
+  [`02-IMPLEMENTATION-PLAN.md`](02-IMPLEMENTATION-PLAN.md) Phase 0 coexistence).
+  Mirrors Curio's dev compose minus decision-backend/decision-mcp. Shared
+  `ADMIN_SECRET` (hub ↔ service provisioning) and `AGENT_TRACE_GATEWAY_SECRET`
+  (gateway HMAC).

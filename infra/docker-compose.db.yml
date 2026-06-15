@@ -1,0 +1,21 @@
+# Minimal Postgres for Phase 0.1 layout. Phase 0.5 adds the full dev stack
+# (tracehub-api, agent-trace-service, tracehub-web) in docker-compose.dev.yml.
+#
+# Suggested host port when Curio already uses 5432 (and 5433 may be taken): 5437:5432
+#   docker compose -f infra/docker-compose.db.yml up -d
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tracehub
+      POSTGRES_PASSWORD: tracehub
+      POSTGRES_DB: tracehub
+    ports:
+      - "5437:5432"
+    volumes:
+      - traceshub_pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  traceshub_pgdata:

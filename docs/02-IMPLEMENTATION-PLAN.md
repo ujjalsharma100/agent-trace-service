@@ -15,13 +15,16 @@ reusing the patterns as a blueprint while writing all hub code fresh.
 | Thing | Value |
 |-------|-------|
 | Web domain | `traceshub.com` |
-| API domain | `api.traceshub.com` (`http://localhost:8000` dev) |
+| API domain | `api.traceshub.com` |
+| Local API URL (dev) | `http://localhost:8100` when running **beside Curio** (see coexistence row); `http://localhost:8000` is fine if TracesHub is the only stack |
 | Hub API package | `tracehub_api` (FastAPI) |
 | Hub DB | `tracehub` |
-| Storage engine (subtree) | `services/agent-trace-service` (vendored), DB `agent_trace`, port `5050` |
+| Storage engine (subtree) | `services/agent-trace-service` (vendored), DB `agent_trace`, **container** port `5050`; map a **different host** port (e.g. `5150:5050`) if Curio already uses `5050` |
+| Local dev vs Curio (same machine) | Use **different host ports** for Postgres, API, web, and `agent-trace-service`, and a **separate** `cloudflared` process pointing at TracesHub’s API port. Suggested TracesHub **host** bindings when Curio is up: Postgres `5437→5432`, API `8100→8000`, web `5174→5173`, storage `5150→5050` (tune to whatever `lsof` shows free) |
 | CLI (subtree) | `clis/agent-trace-cli` (vendored for visibility + upstreaming; hub does not run it) |
 | OSS subtree workflow | branch → `git subtree push` → PR on OSS repo → `subtree pull --squash` (see `docs/OSS-SUBTREE-GUIDELINES.md`) |
-| GitHub App name / slug | `TracesHub` / `traceshub` |
+| GitHub App (prod) name / slug | `TracesHub` / `traceshub` |
+| GitHub App (local dev) name / slug | `TracesHub Dev` / `traceshub-dev` (separate registration; see Phase 0 manual playbook) |
 | PAT format | `thub_pat_<12hex>_<secret64hex>`, argon2(secret) stored |
 | PAT scopes | `traces:read`, `traces:write` |
 | Gateway route | `/at/{owner_slug}/{project_slug}/{upstream:path}` |
@@ -60,21 +63,26 @@ reusing the patterns as a blueprint while writing all hub code fresh.
   `services/agent-trace-service/` + `clis/agent-trace-cli/` (subtree mount points),
   `infra/` (compose, postgres init, secrets/, `.env.example`), `docs/`. Add root
   `README`, `CLAUDE.md`, `.gitignore`, `LICENSE` (decide license), `SECURITY.md`.
-- **0.2 (MANUAL)** Register the **TracesHub** GitHub App. Permissions (leaner than
-  Curio — no PR/Issues write): **Repository contents: Read**, **Metadata: Read**,
-  **Members (org): Read**; **user identification (OAuth) enabled**; webhook events
-  **`installation`, `installation_repositories`, `push`**. Generate a client
-  secret + private key (`.pem`). Set callback URL → `api.traceshub.com/api/v1/auth/callback`
-  and a dev callback via tunnel.
+- **0.2 (MANUAL)** Register **two** GitHub Apps (prod + dev). Shared permission
+  shape for both (leaner than Curio — no PR/Issues write): **Repository contents:
+  Read**, **Metadata: Read**, **Members (org): Read**; **user identification (OAuth)
+  enabled**; webhook events **`installation`, `installation_repositories`, `push`**.
+  Generate a client secret + private key (`.pem`) **per app**. Prod callback →
+  `https://api.traceshub.com/api/v1/auth/callback`; dev callback → your tunnel URL
+  (see **Phase 0 — Manual playbook: prod vs dev GitHub Apps + Cloudflare tunnel** below).
 - **0.3** `infra/.env.example` with every var: `DATABASE_URL`, `SESSION_SECRET`,
   `ADMIN_SECRET`, `AGENT_TRACE_GATEWAY_SECRET`, `AGENT_TRACE_SERVICE_URL`,
   `GITHUB_APP_ID/CLIENT_ID/CLIENT_SECRET/WEBHOOK_SECRET/PRIVATE_KEY_PATH/SLUG`,
   `TRACEHUB_API_BASE_URL`, `TRACEHUB_WEB_BASE_URL`, `AGENT_TRACE_CLI_DOCS_URL`.
-- **0.4 (MANUAL)** Dev tunnel (e.g. `cloudflared`/`ngrok`) for OAuth callback +
-  webhook delivery; record the URL in `.env`.
+- **0.4 (MANUAL)** Dev tunnel (`cloudflared` recommended) so GitHub can reach your
+  laptop for OAuth callback + webhooks; point the **TracesHub Dev** app at that
+  URL and record it in local `.env` (playbook below).
 - **0.5** `infra/docker-compose.dev.yml`: `db` (postgres:16-alpine, multi-DB init
-  for `tracehub` + `agent_trace`), `tracehub-api` (:8000), `agent-trace-service`
-  (:5050), `tracehub-web`. Shared `ADMIN_SECRET` + `AGENT_TRACE_GATEWAY_SECRET`.
+  for `tracehub` + `agent_trace`), `tracehub-api`, `agent-trace-service`,
+  `tracehub-web`. Prefer **host port mappings** that do not collide with a local
+  Curio stack (see naming table + Phase 0 playbook: coexistence). Containers can
+  keep internal ports `8000` / `5050` / `5173`; only the **published** host ports
+  must differ. Shared `ADMIN_SECRET` + `AGENT_TRACE_GATEWAY_SECRET`.
 - **0.6** Vendor the OSS components as git subtrees + adopt the OSS-boundary
   governance. Add remotes and `git subtree add` for
   `services/agent-trace-service` (from the OSS repo `main`) and
@@ -85,11 +93,126 @@ reusing the patterns as a blueprint while writing all hub code fresh.
   These keep platform-specific code out of the subtrees and define the
   branch → `subtree push` → PR → `subtree pull` upstreaming flow.
 
+### Phase 0 — Manual playbook: prod vs dev GitHub Apps + Cloudflare tunnel
+
+Use **two separate GitHub App registrations** so production credentials never
+point at your laptop, and local OAuth/webhooks never fight with hosted URLs.
+
+#### Why two apps
+
+| | **TracesHub** (prod) | **TracesHub Dev** (local) |
+|---|----------------------|---------------------------|
+| **Purpose** | Hosted `api.traceshub.com` / `traceshub.com` | `localhost` + tunnel only |
+| **Callback URL** | `https://api.traceshub.com/api/v1/auth/callback` | `https://<tunnel-host>/api/v1/auth/callback` |
+| **Webhook URL** | `https://api.traceshub.com/api/v1/webhooks/github` | `https://<tunnel-host>/api/v1/webhooks/github` |
+| **Install link** (Phase 3) | `https://github.com/apps/traceshub/installations/new` | `https://github.com/apps/traceshub-dev/installations/new` (slug must match what you chose) |
+
+GitHub allows only **one** "User authorization callback URL" per GitHub App, so a
+single app cannot cleanly serve both prod HTTPS and a changing dev tunnel URL.
+A second app is the standard fix.
+
+#### Coexistence with Curio on the same laptop
+
+Curio and TracesHub are **independent repos**, but developers often run both. Avoid:
+
+| Conflict | What to do |
+|----------|------------|
+| **Host port already in use** | Before `compose up`, check what Curio binds (e.g. `lsof -iTCP -sTCP:LISTEN` or your Curio compose). Give TracesHub **different published ports** on the host (see naming table for a suggested set). |
+| **Postgres** | Only one process can listen on host `5432`. Publish TracesHub’s DB as e.g. `5437:5432` and set `DATABASE_URL` to use host port `5437` from the host (or use Docker network DNS `db:5432` from other compose services only). |
+| **`cloudflared`** | Curio’s tunnel and TracesHub’s tunnel are **separate processes**; each `--url` must target **that product’s API host port** (Curio → Curio port, TracesHub → TracesHub port, e.g. `http://localhost:8100`). Do not point the **TracesHub Dev** GitHub App at Curio’s tunnel URL. |
+| **GitHub Apps** | Curio’s GitHub App(s) stay on Curio. **TracesHub Dev** uses its own callback/webhook URLs (your TracesHub tunnel only). |
+
+Internal container ports (`8000`, `5050`, etc.) can match across projects; conflicts are **host**-side.
+
+#### A — Register **TracesHub** (production)
+
+Do this once for the real product. Skip or defer if you are not deploying yet.
+
+1. In GitHub: **Settings** (your user or org that will *own* the app) → **Developer settings** → **GitHub Apps** → **New GitHub App**.
+2. **GitHub App name:** `TracesHub` (or your legal product name; must be unique on GitHub).
+3. **Homepage URL:** `https://traceshub.com` (or staging URL if you prefer).
+4. **Identifying and authorizing users:** enable **Request user authorization (OAuth) during installation** if you use the install-time OAuth flow; ensure **User-to-server tokens** / user identification is available per GitHub’s UI for your chosen setup (match whatever the hub implements in Phase 2–3).
+5. **Callback URL:** `https://api.traceshub.com/api/v1/auth/callback` (must match `TRACEHUB_API_BASE_URL` + the hub’s OAuth callback path).
+6. **Webhook:** check **Active**; **Webhook URL:** `https://api.traceshub.com/api/v1/webhooks/github`.
+7. **Repository permissions:** **Contents** → Read-only; **Metadata** → Read-only.
+8. **Organization permissions:** **Members** → Read-only (needed for org member sync).
+9. **Subscribe to events:** `Installation`, `Installation repositories`, `Push` (names may appear as checkboxes; align with Phase 0.2 list).
+10. **Where can this GitHub App be installed?** Usually **Any account** for a public product (tighten later if you use a private listing).
+11. **Create GitHub App.** Note **App ID**; copy **Client ID**; generate and copy **Client secrets** (store in vault / `infra/secrets/`, never commit).
+12. **Generate a private key** (RSA); download the `.pem` → save as e.g. `infra/secrets/traceshub-prod.pem` (gitignored).
+13. **Webhook secret:** after creation, set or reveal the webhook signing secret → `GITHUB_APP_WEBHOOK_SECRET` (prod).
+
+#### B — Register **TracesHub Dev** (local only)
+
+Repeat the same wizard with **different** URLs and files so prod and dev never share secrets.
+
+1. **GitHub Apps** → **New GitHub App**.
+2. **GitHub App name:** `TracesHub Dev` (display name; unique on GitHub).
+3. **URL slug:** pick something stable and short, e.g. `traceshub-dev` — this becomes `https://github.com/apps/<slug>/installations/new`.
+4. **Homepage URL:** e.g. `http://localhost:5174` (TracesHub web) or `http://localhost:8100` (API) when avoiding Curio’s usual `5173` / `8000`; any reachable dev URL is fine.
+5. **Callback URL:** **do not fill yet** if you do not know the tunnel host; you can create the app and come back to **Edit** after step C. Final value must be exactly:
+
+   `https://<YOUR_TUNNEL_HOST>/api/v1/auth/callback`
+
+   Use **https** and no trailing slash beyond what your hub expects (match prod path pattern).
+
+6. **Webhook URL:** `https://<YOUR_TUNNEL_HOST>/api/v1/webhooks/github` — same host as callback; edit after the tunnel is up.
+7. Mirror **permissions** and **events** from section A (Contents Read, Metadata Read, Members Read; installation + installation_repositories + push).
+8. **Create GitHub App**; generate **client secret**, **private key** (`.pem`), and **webhook secret** into **separate** files, e.g. `traceshub-dev.pem`, and document the three IDs in local `.env` only.
+
+#### C — Cloudflare Quick Tunnel (ephemeral URL, good for dev)
+
+Goal: expose the **TracesHub** hub API on **your chosen host port** (e.g. `8100` when Curio uses `8000`) so GitHub can redirect the browser (OAuth) and `POST` webhooks.
+
+1. Install `cloudflared` (Cloudflare’s daemon): follow Cloudflare’s docs for your OS (`brew install cloudflare/cloudflare/cloudflared` on macOS is typical).
+2. Start the TracesHub API on that host port (from compose publish or `uvicorn` bind).
+3. In a **separate** terminal from Curio’s tunnel (if any), run a quick tunnel aimed **only** at TracesHub’s port (ephemeral hostname each run unless you configure a named tunnel):
+
+   ```bash
+   cloudflared tunnel --url http://localhost:8100
+   ```
+
+   Replace `8100` with whatever host port TracesHub actually uses.
+
+4. Copy the printed **https://….trycloudflare.com** (or similar) hostname — this is `<YOUR_TUNNEL_HOST>` **including no path**.
+5. Go back to the **TracesHub Dev** app → **Edit**:
+   - **Callback URL:** `https://<YOUR_TUNNEL_HOST>/api/v1/auth/callback`
+   - **Webhook URL:** `https://<YOUR_TUNNEL_HOST>/api/v1/webhooks/github`
+   - Save.
+
+6. Put the same origin into local env (see `infra/.env.example`):
+
+   - `TRACEHUB_API_BASE_URL=https://<YOUR_TUNNEL_HOST>`
+   - `TRACEHUB_WEB_BASE_URL=http://localhost:<web-port>` (e.g. `5174` beside Curio’s `5173`, or tunnel the web too if you test cookies across origins — align CORS and cookie `SameSite` with how the hub is implemented).
+
+**Note:** Quick tunnel URLs change every time you restart `cloudflared` unless you set up a **named tunnel** with a fixed DNS record in a zone you control. For day-to-day dev, either live with re-editing the dev GitHub App URLs when the hostname changes, or invest in a named tunnel + stable `dev-api.traceshub.com`-style hostname documented in infra.
+
+#### D — Wire `.env` for dev vs prod
+
+- **Never** put prod `.pem` / secrets in the same file you use for daily dev if you can avoid it; use two env files (e.g. `.env.prod` and `.env.local`, both gitignored) or a secrets manager.
+- For **local** work, set **only** the **TracesHub Dev** app’s:
+
+  - `GITHUB_APP_ID`
+  - `GITHUB_APP_CLIENT_ID`
+  - `GITHUB_APP_CLIENT_SECRET`
+  - `GITHUB_APP_WEBHOOK_SECRET`
+  - `GITHUB_APP_PRIVATE_KEY_PATH` → path to `traceshub-dev.pem`
+  - `GITHUB_APP_SLUG=traceshub-dev` (must match the dev app’s URL slug)
+
+- Hosted production uses the **TracesHub** app values and `https://api.traceshub.com` base URLs.
+
+#### E — OAuth consent and installs during development
+
+1. When testing login/install, GitHub shows **TracesHub Dev** as the requesting app — that is expected.
+2. Install the **dev** app only on **sandbox orgs/repos** you are willing to disconnect later.
+3. If you change tunnel hostname, update the dev app’s callback + webhook URLs **and** `TRACEHUB_API_BASE_URL` together; mismatches cause redirect_uri errors or silent webhook failures.
+
 ### Exit criteria
 - `docker compose -f infra/docker-compose.dev.yml up` brings up `db` + a hello
   `tracehub-api` + `agent-trace-service /health` green.
-- GitHub App exists; `.pem` + secrets present in gitignored `infra/secrets/`;
-  callback + webhook URLs resolve through the tunnel.
+- **Both** GitHub App registrations exist (or prod deferred); **dev** `.pem` +
+  secrets present in gitignored `infra/secrets/`; **dev** callback + webhook URLs
+  resolve through the tunnel to your local API.
 - Both subtrees are present at a pinned upstream `main`; a trial
   `git subtree push`/`pull` round-trips against an OSS feature branch; the
   governance docs + rule are in place.
@@ -149,7 +272,8 @@ reusing the patterns as a blueprint while writing all hub code fresh.
 installable repos.
 
 ### Steps
-- **3.1** Install entry → `https://github.com/apps/traceshub/installations/new`;
+- **3.1** Install entry → `https://github.com/apps/<GITHUB_APP_SLUG>/installations/new`
+  (prod: `traceshub`; local dev: `traceshub-dev` or whatever you registered);
   handle the post-install return (`installation_id`, possible `setup_action`),
   including the "OAuth during install" interleave.
 - **3.2** `services/github_app.py`: App JWT (RS256 from `.pem`) → installation

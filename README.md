@@ -18,8 +18,21 @@ but deliberately deferred; the two evolve independently until then.
 
 ## Status
 
-🔴 **Greenfield.** This repository currently contains only the design and the
-phased implementation plan. Nothing is built yet.
+🟡 **Scaffolded (Phase 0.1).** The monorepo layout is in place: FastAPI hub
+(`api/`), Vite + React web (`web/`), subtree mount points under `services/` and
+`clis/`, and `infra/` (Postgres compose, init SQL, env template). Product
+behavior is still ahead per [`docs/02-IMPLEMENTATION-PLAN.md`](docs/02-IMPLEMENTATION-PLAN.md).
+
+## Repository layout
+
+| Path | Role |
+|------|------|
+| [`api/`](api/) | Hub API (`tracehub_api`, FastAPI) |
+| [`web/`](web/) | Control-plane SPA (Vite + React + TypeScript) |
+| [`services/agent-trace-service/`](services/agent-trace-service/) | Subtree mount for the storage engine (vendored in Phase 0.6) |
+| [`clis/agent-trace-cli/`](clis/agent-trace-cli/) | Subtree mount for the CLI repo (vendored in Phase 0.6) |
+| [`infra/`](infra/) | Compose, Postgres init, `.env.example`; secrets live locally under `infra/secrets/` (gitignored) |
+| [`docs/`](docs/) | Architecture, plan, OSS subtree policy |
 
 ## Where to start
 
@@ -48,4 +61,6 @@ product. Keep platform-specific code in `api/`/`web/`/`infra/`, not in the subtr
 
 ## License
 
-TBD before first public release.
+TracesHub application code in this repository is licensed under the
+[MIT License](LICENSE). Vendored open-source subtrees retain their own licenses
+once added (Phase 0.6).

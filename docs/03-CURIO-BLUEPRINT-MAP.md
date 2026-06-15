@@ -72,7 +72,7 @@ rebuild-from-blueprint code — written fresh, no Curio import.
 
 | TracesHub piece | Curio reference | Notes |
 |---|---|---|
-| Dev compose | `infra/docker-compose.dev.yml` | Keep `db` (postgres:16, multi-DB init) + `tracehub-api` + `agent-trace-service` (:5050) + `tracehub-web`. **Drop** `decision-backend` + `decision-mcp`. Shared `ADMIN_SECRET` + `AGENT_TRACE_GATEWAY_SECRET`. |
+| Dev compose | `infra/docker-compose.dev.yml` | Keep `db` (postgres:16, multi-DB init) + `tracehub-api` + `agent-trace-service` (service port `5050`) + `tracehub-web`. **Drop** `decision-backend` + `decision-mcp`. Shared `ADMIN_SECRET` + `AGENT_TRACE_GATEWAY_SECRET`. If Curio is also running locally, use **non-colliding host port maps** (see `02-IMPLEMENTATION-PLAN.md` Phase 0). |
 | Postgres multi-DB init | `infra/postgres/init-multiple-dbs.sql` | Create `tracehub` + `agent_trace`. |
 | Secrets | `infra/secrets/` (gitignored) | GitHub App `.pem`. |
 
