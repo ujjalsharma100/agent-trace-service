@@ -139,13 +139,29 @@ def get_org_by_slug(slug: str) -> Org | None:
     return Org(id=str(row["id"]), slug=row["slug"], name=row["name"], created_at=row["created_at"])
 
 
-def create_org(slug: str, name: str | None = None) -> Org:
+def create_org(slug: str, name: str | None = None, *, org_id: str | None = None) -> Org:
+    """Create an org.
+
+    ``org_id`` is optional: when omitted the database generates the UUID
+    (the common single-tenant / self-host case). A control plane that mirrors
+    its own orgs into this service can pass an explicit ``org_id`` so the two
+    systems share one identifier — the column is a plain UUID PK, so an
+    explicit value is accepted as-is.
+    """
     db = get_db()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            "INSERT INTO orgs (slug, name) VALUES (%s, %s) RETURNING id, slug, name, created_at",
-            (slug, name),
-        )
+        if org_id is not None:
+            cur.execute(
+                "INSERT INTO orgs (id, slug, name) VALUES (%s, %s, %s) "
+                "RETURNING id, slug, name, created_at",
+                (org_id, slug, name),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO orgs (slug, name) VALUES (%s, %s) "
+                "RETURNING id, slug, name, created_at",
+                (slug, name),
+            )
         row = cur.fetchone()
     return Org(id=str(row["id"]), slug=row["slug"], name=row["name"], created_at=row["created_at"])
 
@@ -379,6 +395,23 @@ def get_project(org_id: str, project_id: str) -> Project | None:
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
     )
+
+
+def delete_project(org_id: str, project_id: str) -> bool:
+    """Delete a project and (via ON DELETE CASCADE) all of its trace data.
+
+    Returns ``True`` if a row was removed, ``False`` if ``(org_id, project_id)``
+    did not exist. The composite ``(org_id, project_id)`` foreign keys on
+    traces / commit_links / conversations / summaries cascade, so this also
+    clears the project's stored artifacts.
+    """
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM projects WHERE org_id = %s AND project_id = %s",
+            (org_id, project_id),
+        )
+        return cur.rowcount > 0
 
 
 def get_project_stats(org_id: str, project_id: str) -> ProjectStats:

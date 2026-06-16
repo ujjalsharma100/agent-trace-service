@@ -33,11 +33,12 @@ Routes:
 
     GET    /api/v1/auth/whoami                 (resolved scope for the bearer)
 
-    POST   /api/v1/orgs                        (admin: register an org)
+    POST   /api/v1/orgs                        (admin: register an org; optional id)
 
     POST   /api/v1/projects                    (admin or org-scoped + projects:write)
     GET    /api/v1/projects                    (list projects in caller's org)
     GET    /api/v1/projects/<project_id>       (project metadata)
+    DELETE /api/v1/projects/<project_id>       (admin or org-scoped + projects:write)
 
     GET    /api/v1/version
     GET    /health
@@ -48,6 +49,7 @@ Run:
 """
 
 import os
+import uuid
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -160,10 +162,11 @@ def root():
             "tokens_admin": "POST/GET /api/v1/tokens, DELETE /api/v1/tokens/<id> (X-Admin-Secret)",
             "tokens_verify": "POST /api/v1/tokens/verify",
             "auth_whoami": "GET /api/v1/auth/whoami",
-            "orgs_create": "POST /api/v1/orgs (X-Admin-Secret)",
+            "orgs_create": "POST /api/v1/orgs (X-Admin-Secret; optional id)",
             "projects_create": "POST /api/v1/projects (org-scoped + projects:write, or X-Admin-Secret)",
             "projects_list": "GET /api/v1/projects",
             "projects_get": "GET /api/v1/projects/<project_id>",
+            "projects_delete": "DELETE /api/v1/projects/<project_id> (org-scoped + projects:write, or X-Admin-Secret)",
         },
     })
 
@@ -264,6 +267,31 @@ def orgs_create():
     slug = body.get("slug")
     if not slug:
         return jsonify({"error": "slug is required"}), 400
+
+    # Optional ``id``: a control plane mirroring its orgs here can pin the
+    # org's UUID so both systems share one identifier. Idempotent by id, then
+    # by slug.
+    org_id = body.get("id")
+    if org_id:
+        try:
+            org_id = str(uuid.UUID(str(org_id)))
+        except (ValueError, AttributeError, TypeError):
+            return jsonify({"error": "id must be a UUID", "code": "invalid_id"}), 400
+        by_id = db_service.get_org_by_id(org_id)
+        if by_id is not None:
+            return jsonify(by_id.to_dict()), 200
+        by_slug = db_service.get_org_by_slug(slug)
+        if by_slug is not None:
+            return jsonify({
+                "error": (
+                    f"Slug {slug!r} already belongs to org {by_slug.id}, "
+                    f"cannot reassign it to {org_id!r}"
+                ),
+                "code": "org_slug_conflict",
+            }), 409
+        org = db_service.create_org(slug=slug, name=body.get("name"), org_id=org_id)
+        return jsonify(org.to_dict()), 201
+
     existing = db_service.get_org_by_slug(slug)
     if existing is not None:
         return jsonify(existing.to_dict()), 200
@@ -403,6 +431,26 @@ def projects_get(project_id):
     if proj is None:
         return jsonify({"error": "Project not found"}), 404
     return jsonify(proj.to_dict())
+
+
+@app.route("/api/v1/projects/<project_id>", methods=["DELETE"])
+def projects_delete(project_id):
+    """De-register a project and cascade-delete its stored artifacts.
+
+    Same authority as ``POST /api/v1/projects``: ``X-Admin-Secret`` (with
+    ``org_id`` / ``org_slug``) or an org-scoped Bearer token carrying
+    ``projects:write``. Project-scoped tokens are barred. Returns 204 on
+    delete, 404 if the project does not exist in the resolved org.
+    """
+    org_id, err = _resolve_caller_for_project_admin()
+    if err:
+        return err
+    if db_service.delete_project(org_id, project_id):
+        return "", 204
+    return jsonify({
+        "error": f"Project {project_id!r} not found in this org",
+        "code": "project_not_found",
+    }), 404
 
 
 # ===================================================================

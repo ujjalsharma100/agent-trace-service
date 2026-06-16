@@ -160,6 +160,94 @@ class TestProjectRegistration(unittest.TestCase):
         )
         self.assertEqual(s, 403, payload)
 
+    # -- org id mirroring ---------------------------------------------------
+
+    def test_admin_creates_org_with_explicit_id(self) -> None:
+        """A control plane can pin the org UUID; the row stores exactly it."""
+        import uuid as _uuid
+
+        pinned = str(_uuid.uuid4())
+        slug = f"pinned-{self.suffix}"
+        s, org = _http(
+            "POST", f"{self.base}/api/v1/orgs",
+            body={"id": pinned, "slug": slug, "name": "Pinned"}, headers=self.admin,
+        )
+        self.assertEqual(s, 201, org)
+        self.assertEqual(org["id"], pinned)
+        # Idempotent by id (same id + slug → 200, same row).
+        s, again = _http(
+            "POST", f"{self.base}/api/v1/orgs",
+            body={"id": pinned, "slug": slug, "name": "Pinned"}, headers=self.admin,
+        )
+        self.assertEqual(s, 200, again)
+        self.assertEqual(again["id"], pinned)
+
+    def test_admin_org_id_with_taken_slug_conflicts(self) -> None:
+        import uuid as _uuid
+
+        slug = f"taken-{self.suffix}"
+        s, _ = _http(
+            "POST", f"{self.base}/api/v1/orgs",
+            body={"slug": slug}, headers=self.admin,
+        )
+        self.assertIn(s, (200, 201))
+        s, payload = _http(
+            "POST", f"{self.base}/api/v1/orgs",
+            body={"id": str(_uuid.uuid4()), "slug": slug}, headers=self.admin,
+        )
+        self.assertEqual(s, 409, payload)
+        self.assertEqual(payload.get("code"), "org_slug_conflict")
+
+    def test_admin_org_invalid_id_400(self) -> None:
+        s, payload = _http(
+            "POST", f"{self.base}/api/v1/orgs",
+            body={"id": "not-a-uuid", "slug": f"badid-{self.suffix}"}, headers=self.admin,
+        )
+        self.assertEqual(s, 400, payload)
+        self.assertEqual(payload.get("code"), "invalid_id")
+
+    # -- delete -------------------------------------------------------------
+
+    def test_admin_deletes_project(self) -> None:
+        slug = f"del-{self.suffix}"
+        s, _ = _http(
+            "POST", f"{self.base}/api/v1/projects",
+            body={"org_id": self.org_id, "project_id": slug}, headers=self.admin,
+        )
+        self.assertEqual(s, 201)
+        s, _ = _http(
+            "DELETE", f"{self.base}/api/v1/projects/{slug}",
+            body={"org_id": self.org_id}, headers=self.admin,
+        )
+        self.assertEqual(s, 204)
+        # Gone: re-create succeeds (201), proving the row was removed.
+        s, _ = _http(
+            "POST", f"{self.base}/api/v1/projects",
+            body={"org_id": self.org_id, "project_id": slug}, headers=self.admin,
+        )
+        self.assertEqual(s, 201)
+
+    def test_delete_missing_project_404(self) -> None:
+        s, payload = _http(
+            "DELETE", f"{self.base}/api/v1/projects/never-{self.suffix}",
+            body={"org_id": self.org_id}, headers=self.admin,
+        )
+        self.assertEqual(s, 404, payload)
+        self.assertEqual(payload.get("code"), "project_not_found")
+
+    def test_project_scoped_token_cannot_delete(self) -> None:
+        target = f"deltarget-{self.suffix}"
+        _http(
+            "POST", f"{self.base}/api/v1/projects",
+            body={"org_id": self.org_id, "project_id": target}, headers=self.admin,
+        )
+        token = self._mint_token(project_id=target, scopes=["read", "write", "projects:write"])
+        s, payload = _http(
+            "DELETE", f"{self.base}/api/v1/projects/{target}",
+            headers=self._bearer(token),
+        )
+        self.assertEqual(s, 403, payload)
+
     # -- read ---------------------------------------------------------------
 
     def test_list_projects_in_caller_org(self) -> None:
