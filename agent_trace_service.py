@@ -30,9 +30,13 @@ import database_service as db
 # set explicitly; in production it must be a strong random string.
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "dev-admin-secret")
 
+# Shared secret for the optional signed-gateway auth path (gateway_auth). When
+# unset, gateway mode is disabled and all requests use bearer-token auth.
+GATEWAY_SECRET = os.environ.get("AGENT_TRACE_GATEWAY_SECRET", "").strip()
+
 # Bumped whenever sql/ contents change. Source of truth for /health and
 # /api/v1/version. Kept in sync with init_db.SCHEMA_VERSION.
-SCHEMA_VERSION = "004-traces-created-at-idx"
+SCHEMA_VERSION = "005-conversation-id-and-summaries"
 
 # Build SHA — populated by deploy / Dockerfile via env. Falls back to "dev".
 BUILD_SHA = os.environ.get("BUILD_SHA", "dev")

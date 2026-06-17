@@ -102,6 +102,7 @@ Default URL: `http://localhost:5000`.
 | `DB_NAME` | `agent_trace` | Database name |
 | `PORT` | `5000` | HTTP port |
 | `ADMIN_SECRET` | `dev-admin-secret` | Required by `X-Admin-Secret` for token + org admin endpoints. Change in production. |
+| `AGENT_TRACE_GATEWAY_SECRET` | _(unset)_ | Enables the optional signed-gateway auth path. When unset, gateway mode is **off** and all requests use bearer tokens. See *Auth flow*. |
 | `BLOB_MAX_BYTES` | `10485760` | Max body size accepted by `POST /api/v1/blobs`. |
 | `BUILD_SHA` | `dev` | Surfaced via `/health` and `/api/v1/version`. Set in CI / Docker build. |
 | `FLASK_DEBUG` | `0` | Set `1` for debug / auto-reload |
@@ -110,12 +111,33 @@ Default URL: `http://localhost:5000`.
 
 ## Auth flow
 
-Two authentication paths, used for different jobs:
+Authentication paths, used for different jobs:
 
 | Header | Used by | What it gates |
 |--------|---------|---------------|
 | `Authorization: Bearer at_…` | clients (CLI) | All sync routes, project list/get, `auth/whoami`. Scope is resolved per token. |
 | `X-Admin-Secret: <secret>` | admin / bootstrap | Token mint/revoke, org create, project create (default-org path). Value must match `ADMIN_SECRET`. |
+| `X-AgentTrace-{Org,User,Project,Signature}` | a control-plane gateway | Same routes as bearer, but the caller is a trusted reverse-proxy that has already authenticated the user and enforced scopes. **Optional, off by default** — only active when `AGENT_TRACE_GATEWAY_SECRET` is set. |
+
+### Signed-gateway auth (optional)
+
+A deployment can front this datastore with a control plane (e.g. a hosted
+product) that authenticates users itself and reverse-proxies their CLI traffic.
+Instead of forwarding a bearer token, the gateway signs each request with a
+shared secret so the datastore can trust the asserted identity:
+
+- **Canonical string** (newline-joined): `<org_id>\n<user_id>\n<project_id>\n<sha256-hex(body)>`
+  (`project_id` is empty when absent; `body` is the raw request bytes).
+- **Signature**: `HMAC-SHA256` of the canonical string keyed by
+  `AGENT_TRACE_GATEWAY_SECRET`, hex-encoded, in `X-AgentTrace-Signature`.
+- **Headers**: `X-AgentTrace-Org`, `X-AgentTrace-User`, `X-AgentTrace-Project`,
+  `X-AgentTrace-Signature`. The legacy `X-Curio-*` names are accepted as a
+  **deprecated alias** (canonical names win when both are present).
+
+A presented-but-invalid signature is a hard `401` (it never silently falls back
+to bearer). When `AGENT_TRACE_GATEWAY_SECRET` is unset the whole path is
+disabled and requests use bearer tokens. Project registration / deletion still
+requires the admin path. See `gateway_auth.py` and `tests/test_gateway_auth.py`.
 
 A token is opaque (`at_<32 url-safe chars>`) and is scoped to a single `(org_id, project_id?)` tuple:
 

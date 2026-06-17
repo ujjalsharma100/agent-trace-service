@@ -57,6 +57,7 @@ from flask import Flask, Response, g, jsonify, request
 
 import agent_trace_service as service
 import database_service as db_service
+import gateway_auth
 
 load_dotenv()
 
@@ -74,9 +75,31 @@ app.config["MAX_CONTENT_LENGTH"] = service.BLOB_MAX_BYTES + 1 * 1024 * 1024
 # ---------------------------------------------------------------------------
 
 def require_auth(f):
-    """Resolve a Bearer token to (org_id, project scope, scopes) on g."""
+    """Resolve the caller to (org_id, project scope, scopes) on ``g``.
+
+    Two paths: the optional signed-gateway header set (off unless
+    ``AGENT_TRACE_GATEWAY_SECRET`` is configured) is tried first, then a
+    plain Bearer token. A presented-but-invalid gateway signature is a hard
+    401 — it never silently falls back to bearer.
+    """
     @wraps(f)
     def wrapper(*args, **kwargs):
+        try:
+            gw_ctx = gateway_auth.try_resolve_gateway(
+                request.headers.get,
+                request.get_data(cache=True, as_text=False),
+                service.GATEWAY_SECRET,
+            )
+        except gateway_auth.GatewaySignatureError:
+            return jsonify({"error": "Invalid gateway signature"}), 401
+        if gw_ctx is not None:
+            g.token_ctx = gw_ctx
+            g.org_id = gw_ctx.org_id
+            g.project_id_scope = gw_ctx.project_id_scope
+            g.scopes = gw_ctx.scopes
+            g.user_id = gw_ctx.token_id
+            return f(*args, **kwargs)
+
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Missing or invalid Authorization header"}), 401
