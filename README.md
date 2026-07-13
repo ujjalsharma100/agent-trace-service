@@ -1,6 +1,12 @@
 # agent-trace-service
 
-A Flask **HTTP datastore** for AI coding-agent traces. It stores and returns **opaque JSON** (traces, ledgers, commit-links, conversation blobs). **All attribution, blame, and domain logic run in the [agent-trace CLI](../agent-trace-cli/)** — this service does not score lines, infer AI authorship, or implement heuristics.
+A Flask **HTTP datastore** for AI coding-agent traces. It stores and returns **opaque JSON** (traces, ledgers, commit-links, conversation blobs). **All attribution, blame, and domain logic run in the [agent-trace CLI](https://github.com/ujjalsharma100/agent-trace-cli)** — this service does not score lines, infer AI authorship, or implement heuristics.
+
+**See it in action:** [▶ 3-min demo (YouTube)](https://www.youtube.com/watch?v=J4LPhV9wURg) · [`agent-trace-cli`](https://github.com/ujjalsharma100/agent-trace-cli) (the client)
+
+<p align="center">
+  <img src="docs/assets/gif-3-local-viewer.gif" alt="Local file viewer with git + agent-trace blame — the self-host / local-first story" width="800">
+</p>
 
 This implementation follows the [Agent Trace](https://agent-trace.dev/) specification and the redesign in the umbrella workspace (same relative paths work when this repo sits next to `AGENT-TRACE-NEW-PROPOSAL.md` at the monorepo root):
 
